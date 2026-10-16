@@ -17,6 +17,18 @@ const devices = new Map();
 // Initialize Telegram Bot with polling
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+bot.on('polling_error', (error) => {
+  console.error('[Telegram Polling Error]:', error.code || error.message);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Unhandled Rejection]:', reason);
+});
+
 // ----------------------------------------------------
 // 1. EXPRESS HTTP SERVER & RENDER KEEP-ALIVE
 // ----------------------------------------------------
@@ -83,7 +95,7 @@ app.post('/api/forward-sms', async (req, res) => {
 });
 
 // Start Express Server
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`🚀 SMS Forwarder Bot Server running on port ${PORT}`);
   console.log(`🤖 Bot Token: ${BOT_TOKEN.substring(0, 10)}...`);
@@ -168,7 +180,7 @@ bot.onText(/\/(start|groupid|id)/i, async (msg) => {
 🏷️ *Group Title:* \`${groupTitle}\`
 🆔 *Group Chat ID:* \`${chatId}\`
 ━━━━━━━━━━━━━━━━━━━━━
-_Copy the Group Chat ID above and set `GROUP_CHAT_ID=${chatId}` in Render Environment Variables to post all SMS messages directly into this group!_`;
+_Copy the Group Chat ID above and set \`GROUP_CHAT_ID=${chatId}\` in Render Environment Variables to post all SMS messages directly into this group!_`;
 
     return bot.sendMessage(chatId, groupReply, { parse_mode: 'Markdown' });
   }
