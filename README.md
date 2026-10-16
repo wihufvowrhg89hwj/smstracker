@@ -1,6 +1,8 @@
-# SMS Forwarder Telegram Bot Server
+# SMS Forwarder Telegram Bot Server (Python & Node.js)
 
-Node.js Backend Bot for managing multiple Android SMS Forwarder devices with Render.com self-ping keep-alive and Telegram Group Forwarding.
+Flask (Python) and Express (Node.js) Backend Bot for managing multiple Android SMS Forwarder devices with Render.com self-ping keep-alive and Telegram Group Forwarding.
+
+---
 
 ## 🌟 Features
 
@@ -26,7 +28,7 @@ Node.js Backend Bot for managing multiple Android SMS Forwarder devices with Ren
 
 ---
 
-## 🚀 How to Deploy on Render.com (Free Tier)
+## 🚀 How to Deploy on Render.com (Python Web Service)
 
 ### Step 1: Push Code to GitHub / GitLab
 1. Upload the `bot/` folder contents to your GitHub repository.
@@ -36,10 +38,10 @@ Node.js Backend Bot for managing multiple Android SMS Forwarder devices with Ren
 2. Click **New +** -> **Web Service**.
 3. Connect your GitHub repository containing the bot code.
 4. Set the build settings:
-   - **Name**: `sms-forwarder-bot` (or any unique name)
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `npm start`
+   - **Name**: `sms-forwarder-bot`
+   - **Environment**: `Python 3`
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `gunicorn app:app`
    - **Plan**: `Free`
 
 ### Step 3: Add Environment Variables on Render
