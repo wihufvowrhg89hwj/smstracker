@@ -5,7 +5,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || '8832238459:AAGR6_N00HtDjJv7IEdwu-y-1U2RW9VO9rk';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '8753024194';
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '';
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || process.env.GROUPCHATID || '-1004375481014';
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || process.env.URL || `http://localhost:${PORT}`;
 
 const app = express();
