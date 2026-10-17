@@ -305,21 +305,13 @@ def forward_sms():
         f"💬 *Message:*\n`{body}`"
     )
 
-    targets = set()
-    if GROUP_CHAT_ID:
-        targets.add(str(GROUP_CHAT_ID).strip())
-    elif ADMIN_CHAT_ID:
-        targets.add(str(ADMIN_CHAT_ID).strip())
-
-    sent_count = 0
-    for target in targets:
-        if not target:
-            continue
-        try:
-            bot.send_message(target, formatted_msg, parse_mode="Markdown")
-            sent_count += 1
-        except Exception as e:
-            print(f"[Error] Failed to forward SMS to target {target}: {e}")
+    target = str(GROUP_CHAT_ID).strip() if GROUP_CHAT_ID else "-1004375481014"
+    try:
+        bot.send_message(target, formatted_msg, parse_mode="Markdown")
+        sent_count = 1
+    except Exception as e:
+        print(f"[Error] Failed to forward SMS to target {target}: {e}")
+        sent_count = 0
 
     return jsonify({"success": True, "sentTo": sent_count})
 
