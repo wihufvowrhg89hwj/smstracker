@@ -656,9 +656,12 @@ bot.on('callback_query', async (query) => {
       });
       bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled' });
 
-      const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\n📥 All past inbox SMS, new, and upcoming SMS will be uploaded and forwarded.`;
-      if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, onMsg, { parse_mode: 'Markdown' });
-      if (currentGroupChatId && currentGroupChatId !== ADMIN_CHAT_ID) bot.sendMessage(currentGroupChatId, onMsg, { parse_mode: 'Markdown' });
+      const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\nUpcoming live SMS will be forwarded directly to this group.`;
+      if (currentGroupChatId) {
+        bot.sendMessage(currentGroupChatId, onMsg, { parse_mode: 'Markdown' });
+      } else if (ADMIN_CHAT_ID) {
+        bot.sendMessage(ADMIN_CHAT_ID, onMsg, { parse_mode: 'Markdown' });
+      }
       break;
 
     case 'sms_off':
@@ -676,8 +679,11 @@ bot.on('callback_query', async (query) => {
       bot.answerCallbackQuery(query.id, { text: '🔴 SMS Forwarding Disabled' });
 
       const offMsg = `🔴 *SMS Forwarding Disabled* for \`${dev.deviceAlias}\`.\n\nUpcoming SMS messages will be stopped.`;
-      if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, offMsg, { parse_mode: 'Markdown' });
-      if (currentGroupChatId && currentGroupChatId !== ADMIN_CHAT_ID) bot.sendMessage(currentGroupChatId, offMsg, { parse_mode: 'Markdown' });
+      if (currentGroupChatId) {
+        bot.sendMessage(currentGroupChatId, offMsg, { parse_mode: 'Markdown' });
+      } else if (ADMIN_CHAT_ID) {
+        bot.sendMessage(ADMIN_CHAT_ID, offMsg, { parse_mode: 'Markdown' });
+      }
       break;
 
     case 'rename':
