@@ -9,6 +9,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '8832238459:AAGR6_N00HtDjJv7IEdwu-y-1
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '8753024194';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || process.env.GROUPCHATID || '-1004375481014';
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || process.env.URL || `http://localhost:${PORT}`;
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://sms-tracker-6eeed-default-rtdb.asia-southeast1.firebasedatabase.app';
 
 const DEVICES_FILE = path.join(__dirname, 'devices.json');
 
@@ -46,8 +47,60 @@ function saveDevices() {
   }
 }
 
+// Firebase Realtime Sync
+async function fetchDevicesFromFirebase() {
+  try {
+    const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/devices.json`;
+    const response = await fetch(url);
+    if (response.ok) {
+      const data = await response.json();
+      if (data && typeof data === 'object') {
+        Object.keys(data).forEach(devId => {
+          const devInfo = data[devId];
+          if (devInfo && typeof devInfo === 'object') {
+            let lastSeenDate = new Date();
+            if (typeof devInfo.lastSeen === 'number') {
+              lastSeenDate = devInfo.lastSeen > 100000000000 ? new Date(devInfo.lastSeen) : new Date(devInfo.lastSeen * 1000);
+            }
+
+            devices.set(devId, {
+              deviceId: devId,
+              deviceAlias: devInfo.deviceAlias || devInfo.model || 'Android Device',
+              model: devInfo.model || 'Unknown Model',
+              batteryLevel: devInfo.batteryLevel ?? -1,
+              isCharging: !!devInfo.isCharging,
+              isServiceRunning: devInfo.isServiceRunning !== false,
+              isForwardingEnabled: devInfo.isForwardingEnabled !== false,
+              killReason: devInfo.killReason || 'Synced via Firebase',
+              lastSeen: lastSeenDate
+            });
+          }
+        });
+        saveDevices();
+        console.log(`[Firebase Sync] Synced ${devices.size} device(s) from Firebase Realtime Database`);
+      }
+    }
+  } catch (err) {
+    console.error(`[Firebase Sync Error]`, err.message);
+  }
+}
+
+async function updateDeviceInFirebase(devId, patchData) {
+  try {
+    const url = `${FIREBASE_DATABASE_URL.replace(/\/$/, '')}/devices/${devId}.json`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patchData)
+    });
+  } catch (err) {
+    console.error(`[Firebase Update Error]`, err.message);
+  }
+}
+
 // Load persisted devices on startup
 loadDevices();
+fetchDevicesFromFirebase();
 
 // Initialize Telegram Bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -88,6 +141,7 @@ function handleDeviceRegistrationData(data) {
 
   devices.set(deviceId, updatedDev);
   saveDevices();
+  updateDeviceInFirebase(deviceId, updatedDev);
   console.log(`[Device Registered/Updated] ID: ${deviceId} (${updatedDev.deviceAlias})`);
   return updatedDev;
 }
@@ -104,18 +158,8 @@ function buildMainReplyKeyboard() {
 
 function buildDeviceControlMessage(dev) {
   const lastSeenMs = dev.lastSeen ? (new Date() - new Date(dev.lastSeen)) : 0;
-  const minsAgo = Math.floor(lastSeenMs / 60000);
-  const timeText = minsAgo === 0 ? 'just now' : `${minsAgo}m ago`;
-
-  let liveStatus = '🟢 *Online & Active*';
-  if (lastSeenMs >= 20 * 60 * 1000) {
-    liveStatus = `🔴 *Offline / Inactive* _(${timeText})_`;
-  } else if (lastSeenMs >= 7 * 60 * 1000) {
-    liveStatus = `🟡 *Standby / Background* _(${timeText})_`;
-  } else {
-    liveStatus = `🟢 *Online & Active* _(${timeText})_`;
-  }
-
+  const isOnline = lastSeenMs < 5 * 60 * 1000;
+  const liveStatus = isOnline ? '🟢 *Online & Active*' : '🔴 *Offline / Inactive*';
   const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
   const batText = dev.batteryLevel >= 0 ? `${dev.batteryLevel}% ${dev.isCharging ? '🔌 (Charging)' : '🔋'}` : 'Unknown';
 
@@ -178,7 +222,7 @@ function buildSmsSettingsKeyboard(devId) {
 }
 
 // ----------------------------------------------------
-// 1. EXPRESS HTTP ENDPOINTS (Multi-route support)
+// 1. EXPRESS HTTP ENDPOINTS
 // ----------------------------------------------------
 
 app.get('/', (req, res) => {
@@ -190,6 +234,7 @@ app.get('/', (req, res) => {
     status: 'online',
     app: 'SMS Forwarder Telegram Bot',
     connectedDevices: devices.size,
+    firebaseUrl: FIREBASE_DATABASE_URL,
     timestamp: new Date().toISOString()
   });
 });
@@ -198,7 +243,6 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'alive', time: new Date().toISOString() });
 });
 
-// Registration Endpoints (Supports ALL variations: POST / GET / Query / Body)
 const registerRoutes = ['/api/register-device', '/register-device', '/register', '/api/register'];
 
 registerRoutes.forEach(route => {
@@ -215,7 +259,8 @@ registerRoutes.forEach(route => {
   });
 });
 
-app.get('/api/devices', (req, res) => {
+app.get('/api/devices', async (req, res) => {
+  await fetchDevicesFromFirebase();
   res.json({
     count: devices.size,
     devices: Array.from(devices.values())
@@ -261,11 +306,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`👤 Admin Chat ID: ${ADMIN_CHAT_ID}`);
   if (GROUP_CHAT_ID) console.log(`👥 Group Chat ID: ${GROUP_CHAT_ID}`);
   console.log(`🔗 External URL: ${RENDER_EXTERNAL_URL}`);
+  console.log(`🔥 Firebase URL: ${FIREBASE_DATABASE_URL}`);
   console.log(`💾 Persisted Devices: ${devices.size}`);
   console.log(`====================================================`);
 });
 
-// Self-Ping Keep Alive (every 3 minutes to strictly prevent Render spin-down)
+// Self-Ping Keep Alive
 setInterval(async () => {
   try {
     const pingUrl = RENDER_EXTERNAL_URL.endsWith('/') ? `${RENDER_EXTERNAL_URL}ping` : `${RENDER_EXTERNAL_URL}/ping`;
@@ -274,28 +320,7 @@ setInterval(async () => {
   } catch (err) {
     console.error(`[Self-Ping Keep-Alive] Ping failed:`, err.message);
   }
-}, 3 * 60 * 1000);
-
-function extractAndAutoRegisterDevice(text) {
-  if (!text) return;
-
-  const idMatch = text.match(/🆔\s*\*?ID:\*?\s*`?([a-zA-Z0-9_-]+)`?/i);
-  if (!idMatch) return;
-
-  const devId = idMatch[1].trim();
-  const aliasMatch = text.match(/📱\s*\*?Device:\*?\s*`?([^`\n]+)`?/i);
-  const devAlias = aliasMatch ? aliasMatch[1].trim() : 'Android Device';
-
-  const modelMatch = text.match(/📲\s*\*?Model:\*?\s*`?([^`\n]+)`?/i);
-  const devModel = modelMatch ? modelMatch[1].trim() : devAlias;
-
-  handleDeviceRegistrationData({
-    deviceId: devId,
-    deviceAlias: devAlias,
-    model: devModel,
-    killReason: 'Auto-registered via Telegram notification'
-  });
-}
+}, 5 * 60 * 1000);
 
 // Telegram Message Handler
 bot.on('message', async (msg) => {
@@ -303,8 +328,8 @@ bot.on('message', async (msg) => {
   const chatType = msg.chat.type;
   const text = (msg.text || '').trim();
 
-  // Extract & Auto-register device if message contains device details
-  extractAndAutoRegisterDevice(text);
+  // Fetch latest devices from Firebase on any command
+  await fetchDevicesFromFirebase();
 
   if (chatType === 'group' || chatType === 'supergroup' || chatType === 'channel') {
     if (text.startsWith('/') || text.toLowerCase().includes('groupid') || text.toLowerCase().includes('id')) {
@@ -359,7 +384,7 @@ bot.on('message', async (msg) => {
       if ((now - new Date(d.lastSeen)) < 5 * 60 * 1000) onlineCount++;
     });
 
-    const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
+    const statusText = `📊 *SYSTEM OVERALL STATUS*\n━━━━━━━━━━━━━━━━━━━━━\n🌐 *Bot Server:* 🟢 Online (Node.js)\n🔥 *Firebase Realtime:* 🟢 Synced\n📱 *Total Connected Devices:* ${devices.size}\n🟢 *Online Devices:* ${onlineCount}\n🔴 *Offline Devices:* ${devices.size - onlineCount}\n━━━━━━━━━━━━━━━━━━━━━\n_Select \`📱 Connected Devices\` from bottom menu to view individual devices._`;
     return bot.sendMessage(chatId, statusText, {
       parse_mode: 'Markdown',
       reply_markup: buildMainReplyKeyboard()
@@ -388,6 +413,7 @@ bot.on('message', async (msg) => {
     dev.deviceAlias = newName;
     devices.set(dev.deviceId, dev);
     saveDevices();
+    updateDeviceInFirebase(dev.deviceId, { deviceAlias: newName });
 
     await bot.sendMessage(chatId, `✅ Device renamed from \`${oldName}\` to \`${newName}\`!`, { parse_mode: 'Markdown' });
     return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
@@ -406,6 +432,8 @@ bot.on('callback_query', async (query) => {
   if (!isAdmin(chatId)) {
     return bot.answerCallbackQuery(query.id, { text: '❌ Unauthorized' });
   }
+
+  await fetchDevicesFromFirebase();
 
   if (data === 'dev_list') {
     if (devices.size === 0) {
@@ -460,6 +488,8 @@ bot.on('callback_query', async (query) => {
       dev.isForwardingEnabled = true;
       devices.set(devId, dev);
       saveDevices();
+      updateDeviceInFirebase(devId, { isForwardingEnabled: true });
+
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
@@ -474,6 +504,8 @@ bot.on('callback_query', async (query) => {
       dev.isForwardingEnabled = false;
       devices.set(devId, dev);
       saveDevices();
+      updateDeviceInFirebase(devId, { isForwardingEnabled: false });
+
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
         message_id: messageId,
