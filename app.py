@@ -281,10 +281,10 @@ def forward_sms():
     )
 
     targets = set()
-    if ADMIN_CHAT_ID:
-        targets.add(str(ADMIN_CHAT_ID).strip())
     if GROUP_CHAT_ID:
         targets.add(str(GROUP_CHAT_ID).strip())
+    elif ADMIN_CHAT_ID:
+        targets.add(str(ADMIN_CHAT_ID).strip())
 
     sent_count = 0
     for target in targets:
